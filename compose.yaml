@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:17.11
+    environment:
+      POSTGRES_USER: ${DEVFLOW_DB_USER}
+      POSTGRES_DB: ${DEVFLOW_DB_NAME}
+      POSTGRES_PASSWORD: ${DEVFLOW_DB_PASSWORD}
+    ports:
+      - "5434:5432"
+    volumes:
+      - devflow_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  devflow_pgdata:
