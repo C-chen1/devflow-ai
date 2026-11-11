@@ -1,6 +1,6 @@
 # DevFlow AI 新窗口交接提示词
 
-> 更新：2026-10-27。正式设计以 [SPEC.md](SPEC.md) 为准，实施与有日期的验证证据以 [PROGRESS.md](PROGRESS.md) 为准，路线取舍见 [DECISIONS.md](DECISIONS.md)。本文件已替换旧的 0.5 接续点；不要退回重新教学。
+> 更新：2026-10-31。正式设计以 [SPEC.md](SPEC.md) 为准，实施与有日期的验证证据以 [PROGRESS.md](PROGRESS.md) 为准，路线取舍见 [DECISIONS.md](DECISIONS.md)。本文件已替换旧的 0.5 接续点；不要退回重新教学。
 
 你是我的 AI 项目导师和高级 AI Agent 工程师，继续带我完成第二个实习项目 DevFlow AI。RAG 项目已经收尾，当前只作为背景。
 
@@ -8,7 +8,7 @@
 
 1. 一次只推进一个小步骤。先说明为什么需要、解决什么问题、位于架构哪一层，再让我思考或写，你负责引导、检查和挑错。
 2. 核心流程保持：我思考 → 你引导和纠错 → 我重新回答或修改 → 我用自己的话总结 → 验证理解 → 整理已确认内容。不要替我完成尚未推导的设计。
-3. 不直接给完整代码、完整设计或完整表格，除非我明确要求。核心代码由我在 PyCharm 编写；不会时先解释相关 API 并给最小提示。
+3. 默认由我在 PyCharm 编写代码；不会时先解释相关 API 并给最小提示。2026-10-27 用户调整规则：当我明确说某段代码“你帮我完成”时，AI 应直接修改对应代码文件，无需再让我抄写或再次确认。知识点仍照常讲解、思考和核对，代写不等于理解已验证；未被要求的完整设计、代码或表格仍不直接包办。
 4. 不把“懂了”“好的”“继续”视为理解证据。“保存好了”意味着可以检查文件，不代表代码或测试通过。针对已学内容简短核对，不反复纠缠已验证的小语法。
 5. 已完整推导并验证的旧设计不要重教；容易混淆的边界可以简短核对。一次只处理当前问题，不提前展开后续章节。
 6. 每次先给需要使用的变量和函数名称，避免让我同时猜命名与实现。
@@ -16,6 +16,11 @@
 8. 用户已授权 AI 整理 SPEC 和项目文档；2026-10-25 又明确授权合并升级路线。可以记录这些已采纳方向，但不能标成学生逐项理解通过，也不能据此包办实现。到对应开发阶段再小步讲解。
 9. 先检查实际文件和证据，再判断进度。保留用户代码，遇到不确定就明确说明；不输出密钥、隐藏测试内容或标准答案。
 10. 文档更新与诊断不自动授权升级/降级数据库、批量生成核心代码、改依赖或初始化/提交 Git。需要执行时按当前明确请求和小步教学推进。
+11. 2026-10-29 用户认可：整数秒/小数秒这类低影响实现细节，由 AI 给出选择和理由，经采纳后直接推进，不反复卡选择题；已验证的同类规则直接复用，不逐字段重复教学。关键业务行为、事务/停止/权限边界仍按小步推导，不能据此一次包办整套设计。
+
+12. 2026-10-31 加速要求：用户希望一个月内完成剩余项目，每天可投入 3–4 小时。教学按有意义的模块推进，相近知识点合并核对，不反复追问已掌握语法；关键边界仍需理解验证，明确要求代写时完成该模块及必要测试。暂定计划见 MONTH_PLAN.md；不能据此默认包办尚未授权的核心实现、跳过验收或删除 V2/RSI 范围。
+
+13. 2026-10-31 最新加速纠正：用户明确“这种很简单的问题就不用问了吧”。不要再逐句释义、重复二选一、强迫已经正确回答的内容多轮同义复述；按有意义模块推进代码和验证，只在新的关键设计、实质理解偏差时核对。既有且已理解的模式直接复用，新设计仍先讨论；这不等于任意扩展范围或跳过必要测试。
 
 我的主要问题是“看得懂，但无法独立写出”。目标是让我能独立设计、编码，并在面试中解释为什么这样设计。
 
@@ -27,7 +32,7 @@ DevFlow AI 是企业研发 Issue 自主处理平台：把软件 Issue 变成可�
 
 项目目录：`D:\python\PyCharm\Project\05_devflow-ai`
 
-接手时完整读取本文件、`docs/SPEC.md`、`docs/PROGRESS.md`、`docs/DECISIONS.md`，再检查当前步骤涉及的真实代码和测试。历史提示词、附件和旧执行结果不能覆盖最新文件；旧运行结果要保留日期，不能当作当前服务状态。
+接手时先读项目根目录 `AGENTS.md` 和 `docs/PROGRESS.md` 顶部的最新记录，再定位并读取当前步骤涉及的 SPEC、决定、真实代码和测试；需要历史背景时按需查阅本文及其他文档。无需每轮完整重读所有文档。历史提示词、附件和旧执行结果不能覆盖最新文件；旧运行结果要保留日期，不能当作当前服务状态。
 
 ## 三、锁定技术决策
 
@@ -53,7 +58,7 @@ DevFlow AI 是企业研发 Issue 自主处理平台：把软件 Issue 变成可�
 
 2026-10-25 新增路线见 SPEC §9.1、§10，属于已采纳设计，不代表已逐项讲解、已实现或已测试。
 
-### 已有代码与最近证据
+### 早期实现与验证记录（截至 2026-10-26，当前以第五节最新接续为准）
 
 - `src/devflow_ai/api.py`：`/health/live`、`/health/ready`、Engine lifespan 和带 request_id 的请求完成 JSON 日志。
 - `src/devflow_ai/database.py`：五项 DEVFLOW_DB_* 配置校验、连接 URL、同步 Engine 和 `SELECT 1` 检查；不输出配置秘密。
@@ -65,19 +70,47 @@ DevFlow AI 是企业研发 Issue 自主处理平台：把软件 Issue 变成可�
 - 2026-10-24 开发库结构核验：只有空的 `alembic_version`，没有 `tasks` 表和 `task_status` 类型。2026-10-25 确认 PostgreSQL 17.11 容器运行且 healthy；随后学生创建并首次升级 `devflow_test`，该测试库结构结果见上一条。本次未重查开发库 schema，尚无真实 ORM 写入或真实修复证据。
 - 2026-10-25 路线整合时静态核对仍无 Git 仓库，该轮仅修改四份文档。之后学生自行补齐迁移、建立测试配置并执行测试库升级；AI 只读核查并更新忽略规则与进度/交接，未改依赖。
 
-### 尚未实现
+### 当时尚未实现（历史记录，不代表当前）
 
 Repository、Task 业务接口、Worker、RunCoordinator、LangGraph、五个 Agent、Harness、Policy 执行器、ContextBuilder、Verifier、失败恢复和 Benchmark/EvaluationRunner 均未实现。MemoryService、Skills、EvolutionRunner 及执行版本固定机制也未实现。
 
 九张表是 V1 设计，目前只实现 Task ORM 和对应迁移，并在测试库建立 tasks，不能说九张业务表已经建好。其他拟议记忆/实验实体未锁定实际表结构，不提前创建。
 
-## 五、准确接续点：两个模型集成测试通过，准备 Git 基线
+## 五、准确接续点：单 Run 心跳组件完成，接续执行权检查与结果提交事务
 
-**最新状态（2026-10-27，覆盖下方此前教学过程中的“待写/待核对”描述）**：环境已恢复，显式加载 .env.test 并确认实际库 devflow_test 后，两个模型集成测试为 2 passed in 0.46s、退出码 0；tasks 测试前后行数均为 0。省略 status 得到 PENDING、title=None 被拒绝且违规列为 title 均有真实证据；断言理解也已核对通过，不再重教。普通测试同日最近结果为 9 passed、2 skipped、1 warning（原 TestClient 弃用警告），此次源码未变不重跑。其余默认值、约束与正式 Task 持久化尚未全面验证。
+**最新接续（2026-11-01，优先于下方历史记录）**：独立RunHeartbeat组件及HeartbeatConfig已按明确代写授权完成。全量263 passed/1条既有依赖警告 in27.91s、退出0，新增25单测/6真实PG心跳场景；只读public仍Task4/Run0、b312290a866d、无临时schema。心跳每轮独立Session，Event.wait调度，两个停止事件分开，失败原因保留且安全日志，事务局部SQL超时、正常/异常上下文收尾、有界join超时仍活即报HeartbeatShutdownError；组件单次使用。超时参数显式传入、无生产初值，10/30租约初值不变，未改Task Policy/迁移/依赖/Git提交。CLI仍只领取后退出，未接实际处理器/Harness/专业Agent或恢复。下一步仅讨论执行权检查与正式结果保存的共享事务及锁范围，这个接口设计尚未核对；不重复调度/Session/双信号/超时概念，也不让检查方法擅自提交外层结果。
 
-**下一步只学习 Git 暂存区**：学生已正确选择跟踪 .env.example、忽略 .env；已纠正“实际配置对排障无帮助”的理由。学生执行 git init 后，2026-10-27 只读核验 master 分支尚无提交，26 个未跟踪文件；git check-ignore 确认 .env、.env.test、.venv、.idea、.pytest_cache 被忽略。当前只讲暂存区是本次提交内容的准备区及 git add 的作用，再由学生操作；尚未 add/commit，没有可恢复的提交基线。此后小步完成提交、进入 Session/Repository 和 Task 创建查询；不要求机械复制每一列的相同测试，也不把两条测试说成表的全部验收已完成。
+**心跳调度学习补充（2026-11-01）**：独立调度、隔离Session、失败通知、Harness清理及迟到结果事务重查已理解；主流程finally通知心跳退出、等待实际结束再清理，两个信号避免将正常收尾误判失败、超时不能当线程已退出，均已核对。不再拆问显然题。Event.wait代码已由AI代写并有测试，不等于学生独立编码能力已验证；当前接续以上条执行权/结果事务设计为准。
 
-仍在 SPEC 第 9 节阶段 3 / 工作包 A 前期。只推进以下一个小步骤，不先讲 Memory 或 RSI。
+**历史状态（2026-10-27）**：环境已恢复，显式加载 .env.test 并确认实际库 devflow_test 后，两个模型集成测试为 2 passed in 0.46s、退出码 0；tasks 测试前后行数均为 0。省略 status 得到 PENDING、title=None 被拒绝且违规列为 title 均有真实证据；断言理解也已核对通过，不再重教。普通测试同日最近结果为 9 passed、2 skipped、1 warning（原 TestClient 弃用警告），此次源码未变不重跑。其余默认值、约束与正式 Task 持久化尚未全面验证。
+
+**Git 基线已完成（2026-10-27）**：学生已学并执行 init/add/status，正确复述暂存与状态查看；作者身份问题按本仓库配置后，首提交 b854cc8 成功，说明为 chore: establish backend and migration baseline，26 个文件。AI 只读核验提交存在且核验时工作区干净。此后更新的 PROGRESS/HANDOFF 是新的未提交文档修改，未擅自追加提交。
+
+**历史接续记录（2026-10-31，Task 阶段）**：TaskService、创建/查询 API、提交幂等及实际测试库验收已完成。显式 .env.test 并确认实际连接 devflow_test 后，public 已由 41ff63fe9d8a 升级到 a3d12f2f7ab9；四条旧 Task 的既有字段逐项不变且各获不同兼容 key，NOT NULL/命名 UNIQUE/无 key 默认值均已核验。无服务/数据库替身的 TestClient 验收 ready200、缺 key422、创建201、跨 lifespan 重试200同 ID、异内容409、查询200、非法 ID422及不存在404；独立 Session 确认仅一条新 Task 及 Policy。验收临时任务已清理，原四条全部保留。最近完整 pytest 为本日前一步 51 passed、1 条既有警告 in 1.92s，本轮无代码变化未重跑；开发库未升级、独立 Uvicorn/浏览器未验证。下一步进入阶段 3 / 工作包 B 的 Task 准入：先引导应用服务如何校验并持久化 Supervisor 准入决定，不让客户端自行设置 ELIGIBLE，不先包办 Run/worker 或把替身当真实 Agent。已验证的迁移、事务、幂等不重教；用户要求加速且明确代写代码时直接执行。
+
+**已完成的准入学习与实现（2026-10-31）**：条件更新、0 行查询分类、业务异常区分与 Session 刷新理解均已通过，别重问。按用户“直接完成，完成后继续下一步”实现 apply_admission_decision 与 TaskNotFoundError/TaskStateConflictError，在事务中条件更新并 populate_existing=True 刷新查询，成功提交后返回 Task，失败回滚并传播。完整测试现为 88 passed、1 条既有警告 in 3.93s（新增 20 项），覆盖更新/提交失败、旧对象、缺记录、八种状态及真实并发。准入持久化已完成，真实 Supervisor 判断与公开准入接口仍未接入。下一步进入 Run ORM/迁移，先讲明 Run.task_id 外键如何保证 Task 引用存在，再小步推进 RunCoordinator/worker；既有 Run 字段、状态机与角色边界不整体重新设计。本轮未改 public 数据、迁移、依赖或提交 Git。合并教学和一个月冲刺约定继续有效。
+
+**Run 学习与实现补充（2026-10-31，最新接续）**：Run十二字段及b312290a866d迁移已在实际devflow_test核验；Task/Run仓储、LeaseConfig(10/30秒待校准)、定向首次启动协调器均已实现。coordinator.py::RunCoordinator.start_initial_run(task_id,worker_id,creation_key)返回(Run,created)：先查已有结果，必要时锁指定Task后重查，缺失TaskNotFound、已锁TaskClaimBusy、新创建要求ELIGIBLE且无历史；读取固定Policy并核对版本，PG clock_timestamp统一UTC取时，lease截止受Run总时长限制，Run1与Task.RUNNING同事务提交，错误共同回滚。原key即使失败/过期仍返回原Run且不续租，同key换owner抛RunCreationConflictError，不自动生成恢复Run。共享Run迁移fixture已移conftest，36项专项PG测试通过；完整171 passed/1warning in8.22s，退出0。实际public仍Task4/Run0、版本b312290a866d，无临时schema；没有实际Worker/Agent执行、续约或恢复，未改public数据/迁移/依赖或提交Git。
+
+**自动领取补充（2026-10-31，当前最新）**：已新增claim_next_initial_run(worker_id)->Run/None，同一事务扫描/锁候选、内部生成新创建key、复用_private首次创建/租约/Task更新并提交。每次调用取下一项新工作；原创建请求重放仍用明确Task/key接口，不混成跨Task重发。仅ELIGIBLE/Run1，不准入、不恢复、不执行Agent。新增15项真实PG测试，协调器专项51 passed in3.87s，最近全量仍前一步171/1warning；覆盖真实锁连续性、并发、原子回滚、保存key可重放、空闲/错误区分，无public写入/迁移/依赖/Git提交。
+
+**Worker 补充（2026-10-31，当前最新）**：worker.py已完成Worker/RunClaim/CLI。显式--once单次领取，工厂每次新Session，提交后关闭前复制回执避免返回失效ORM；参数先校验，CLI创建Engine并finally清理。成功/空闲stdout JSON退出0；配置错误stderr退出2带安全字段提示，运行失败stderr退出1仅错误类型无原异常/SQL/凭据。默认每进程UUID owner，可覆写owner/LeaseConfig值。Worker专项14 passed in5.78s，包括真实python -m子进程连接隔离PG的领取/再空闲/错误回滚；先只读验证子进程schema才执行，未改public数据/迁移/依赖/Git。最近全量仍此前171/1warning，协调器专项51已通过。当前只领取并退出、不续约/执行Agent/标PASSED，Run保留RUNNING并自然到期，说明见WORKER.md。
+
+**下一步与教学节奏**：用户明确不要再问显然二选一，已验证规则按模块复用，只对新关键设计或实质错误核对。下一步原子心跳续约与执行权检查，owner/Run状态/有效租约/总时长基础边界已理解；新的返回/错误契约合并讨论，随后才接实际处理器与持续循环。不要直接开只领不处理的循环，不把单次CLI当长期Worker/真实修复证据。
+
+**理解核对补充（2026-11-01）**：RunClaim 在 Session 关闭前复制所需字段，CLI 可独立读取并输出 JSON，学生已用自己的话正确解释。Session 关闭不删除已提交 Run，回执也不是实时执行权证明；不再重复此题。接续心跳续约的原子性讨论，无新业务代码或测试结果。
+
+**续约核对补充（2026-11-01，当前接续）**：学生已纠正将 Run 续约与 Task PENDING 准入混淆的错误，正确复述续约只更新心跳/到期时间、未成功则停止继续执行；已理解把数据库故障转换为业务拒绝会误判原因。拟定 renew_lease 与 RunExecutionDeniedError，实际条件更新 0 条为业务拒绝，SQLAlchemyError 原样传播，两者均不授予继续执行权。SPEC §7.4 已记录，代码/测试仍未实现；接下来按模块落实成功结果契约和原子续约实现，不重新问状态、0 条、异常类别等已通过题目。
+
+**当前服务配置状态**：版本/快照混配与空白版本判断均已通过；PolicyConfig 与默认策略已有指定测试。创建服务已提交默认版本和独立快照，但同一对象仍不能自动证明版本标签与内容语义对应。无工具启动策略保留；创建/查询 API 均已实现，真实测试库链路通过，学生手动创建/查询返回内容也已核对。
+
+**续约取时补充（2026-11-01，最新接续）**：先锁 Run、再取数据库当前时间的顺序已纠错并由学生正确复述，不重问等待锁期间过期的例子。下一步代码练习从 RunRepository.get_by_id_for_update 开始，复用已有 select/where/FOR UPDATE/populate_existing 模式，普通等待锁，不使用领取候选的 SKIP LOCKED；仓储不提交、不作续约决策。之后再接 renew_lease 及必要测试，当前加锁方法和续约仍未实现。
+
+**Run 加锁仓储完成（2026-11-01，覆盖上一条待写描述）**：用户明确要求代写后，get_by_id_for_update 已完成普通等待锁及 populate_existing 刷新，不提交/取时/续约。新增六项隔离 PG 场景，包括真实锁等待后刷新终态、调用方提交/回滚释放、旧缓存/删除/缺失和字段不变；Run/协调层专项79 passed in5.58s、退出0。沙箱首次无法访问本机数据库，改用允许访问的执行环境验证通过；不是业务测试失败。全量未重跑，最近全量仍171/1warning。接下来落实 RunCoordinator.renew_lease 的成功结果与原子续约代码/测试；角色、租约资格、异常区分及锁后取时已核对，勿重问。心跳循环和实际处理器仍未实现，public 数据/迁移/依赖/Git 提交未改。
+
+**续约编码与故障暂停（2026-11-01，历史，已由本节首条恢复验证覆盖）**：renew_lease、RunExecutionDeniedError、LeaseRenewal 回执、仓储 renew_lease_if_owned 当时已写入，测试见 test_lease_renewal_integration.py；首次完整 pytest -x 在第一个既有测试的 fixture 建连阶段因 PostgreSQL 超时停止。用户要求等一下并报告 Docker 打不开，暂停项目测试处理环境。启动日志定位 Secrets Engine 的 engine.sock 重命名失败1920；停止故障进程后，目录备份被 Windows 拒绝（原生重命名返回17），没有生成备份或删除数据/改Docker配置。后续用户恢复Docker并要求继续，全量验证结果与准确接续见本节首条。
+
+当前处于 SPEC 第 9 节阶段 3 / 工作包 B。以下为早期学习记录，准确接续以上方最新要求为准，不退回迁移或 Policy 教学，不先讲 Memory 或 RSI。
 
 **学生已经理解**：`tasks.status` 依赖 PostgreSQL 独立枚举类型 `task_status`；降级应先删除表，再删除类型。不要重新要求学生推导这个顺序。
 

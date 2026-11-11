@@ -11,3 +11,50 @@ class TaskStatus(StrEnum):
     REJECTED = "REJECTED"
     ESCALATED ="ESCALATED"
     DECLINED = "DECLINED"
+
+
+class RunStatus(StrEnum):
+    RUNNING = "RUNNING"
+    PASSED = "PASSED"
+    FAILED = "FAILED"
+
+
+class VerificationResult(StrEnum):
+    PASSED = "passed"
+    FAILED = "failed"
+
+
+class AgentRole(StrEnum):
+    SUPERVISOR = "SUPERVISOR"
+    EXPLORER = "EXPLORER"
+    PLANNER = "PLANNER"
+    CODER = "CODER"
+    VERIFIER = "VERIFIER"
+
+
+class FailureCategory(StrEnum):
+    TRANSIENT_EXECUTION_FAILURE = "TRANSIENT_EXECUTION_FAILURE"
+    TOOL_INVOCATION_FAILURE = "TOOL_INVOCATION_FAILURE"
+    ENVIRONMENT_FAILURE = "ENVIRONMENT_FAILURE"
+    EXPLORATION_FAILURE = "EXPLORATION_FAILURE"
+    PLANNING_FAILURE = "PLANNING_FAILURE"
+    IMPLEMENTATION_FAILURE = "IMPLEMENTATION_FAILURE"
+    AGENT_CONTRACT_FAILURE = "AGENT_CONTRACT_FAILURE"
+    POLICY_VIOLATION = "POLICY_VIOLATION"
+    UNKNOWN_FAILURE = "UNKNOWN_FAILURE"
+
+
+class AgentExecutionStatus(StrEnum):
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class ToolCallStatus(StrEnum):
+    REQUESTED = "requested"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    DENIED = "denied"
+    TIMED_OUT = "timed_out"
+    UNKNOWN_RESULT = "unknown_result"
