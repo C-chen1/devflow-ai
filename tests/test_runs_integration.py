@@ -254,7 +254,13 @@ def test_tool_call_migration_roundtrip_and_pending_result(run_session_factory, t
             assert (read_call.status, read_call.stdout_excerpt, read_call.reason) == (
                 status, excerpt, reason,
             )
-            assert read_call.tool_name == "read_file" and read_call.args == {"path": name}
+            assert read_call.tool_name == "read_file" and read_call.args["path"] == name
+            if status == ToolCallStatus.SUCCEEDED:
+                # What was actually read is recorded next to the request, not instead of it.
+                assert read_call.args["observed"]["start_line"] == 1
+                assert read_call.args["observed"]["byte_truncated"] == (reason == "OUTPUT_TRUNCATED")
+            else:
+                assert "observed" not in read_call.args
             assert read_call.exit_code is None
             artifact = observer.scalars(
                 select(Artifact).where(Artifact.tool_call_id == read_id)
@@ -903,6 +909,8 @@ def test_run_migration_roundtrip_preserves_tasks_and_recreates_enum(run_session_
     engine = run_session_factory.kw["bind"]
     schema = engine.get_execution_options()["schema_translate_map"][None]
     revision = load_run_migration()
+    recovery_revision = load_run_migration("e7a1c4d9b2f0_add_run_recovery_action.py")
+    start_revision = load_run_migration("f3b8d2a6c1e4_add_run_recovery_start.py")
     with engine.begin() as connection:
         connection.execute(text(f'SET LOCAL search_path TO "{schema}", public'))
         context = MigrationContext.configure(connection)
@@ -913,6 +921,8 @@ def test_run_migration_roundtrip_preserves_tasks_and_recreates_enum(run_session_
             assert "run_status" not in {item["name"] for item in inspector.get_enums(schema=schema)}
             assert connection.scalar(select(Task.id).where(Task.id == task_id)) == task_id
             revision.upgrade()
+            recovery_revision.upgrade()
+            start_revision.upgrade()
         inspector = inspect(connection)
         assert {column["name"] for column in inspector.get_columns("runs", schema=schema)} == set(Run.__table__.columns.keys())
         enum = next(item for item in inspector.get_enums(schema=schema) if item["name"] == "run_status")

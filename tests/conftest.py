@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from alembic.script import ScriptDirectory
 from sqlalchemy import inspect, text
 from sqlalchemy.schema import CreateSchema, DropSchema
 
@@ -66,9 +67,43 @@ def run_session_factory(test_session_factory):
     spec = importlib.util.spec_from_file_location(path.stem, path)
     revision = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(revision)
+    recovery_path = Path(__file__).resolve().parents[1] / "migrations/versions/e7a1c4d9b2f0_add_run_recovery_action.py"
+    recovery_spec = importlib.util.spec_from_file_location(recovery_path.stem, recovery_path)
+    recovery_revision = importlib.util.module_from_spec(recovery_spec)
+    recovery_spec.loader.exec_module(recovery_revision)
+    start_path = Path(__file__).resolve().parents[1] / "migrations/versions/f3b8d2a6c1e4_add_run_recovery_start.py"
+    start_spec = importlib.util.spec_from_file_location(start_path.stem, start_path)
+    start_revision = importlib.util.module_from_spec(start_spec)
+    start_spec.loader.exec_module(start_revision)
     with engine.begin() as connection:
         connection.execute(text(f'SET LOCAL search_path TO "{schema}", public'))
         with Operations.context(MigrationContext.configure(connection)):
             revision.upgrade()
+            recovery_revision.upgrade()
+            start_revision.upgrade()
     return test_session_factory
+
+
+@pytest.fixture
+def worker_session_factory(run_session_factory):
+    """Apply the remaining Run-side migrations inside this test's isolated schema.
+
+    Same chain as the worker integration tests: one Run needs executions, handoffs,
+    tool calls, artifacts, failures and the recovery columns. Nothing here touches the
+    public schema or an existing database.
+    """
+    engine = run_session_factory.kw["bind"]
+    schema = engine.get_execution_options()["schema_translate_map"][None]
+    scripts = ScriptDirectory(str(Path(__file__).resolve().parents[1] / "migrations"))
+    with engine.begin() as connection:
+        connection.execution_options(schema_translate_map=None)
+        connection.execute(text(f'SET LOCAL search_path TO "{schema}", public'))
+        with Operations.context(MigrationContext.configure(connection)):
+            for revision_id in (
+                "c7e1a29b4d63", "d4f63c192ba8", "f83ab2d16c49",
+                "ab6e1c30f42d", "e8c27b14a693", "4b79c6e21a50", "62eae84cebd1",
+                "97f3a25cb190", "a43cb50f67e9", "f154b6e82639",
+            ):
+                scripts.get_revision(revision_id).module.upgrade()
+    return run_session_factory
 

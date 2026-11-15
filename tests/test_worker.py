@@ -2,12 +2,53 @@ from datetime import datetime, timezone
 import json
 from unittest.mock import Mock
 from uuid import uuid4
+from threading import Event
 
 import pytest
 
 import devflow_ai.worker as worker_module
 from devflow_ai.enums import RunStatus
 from devflow_ai.worker import RunClaim, main, resolve_run_directories
+
+
+def test_recovery_loop_stops_after_result_and_forwards_parameters(tmp_path, monkeypatch):
+    worker = worker_module.Worker(None, "loop-worker")
+    stop = Event()
+    scan = Mock(return_value={"outcome": "idle", "run_id": None})
+    monkeypatch.setattr(worker, "reclaim_next_expired_run", scan)
+    seen = []
+
+    def receive(result):
+        seen.append(result)
+        stop.set()
+
+    worker.run_recovery_loop(
+        workspaces_root=tmp_path, artifacts_root=tmp_path,
+        supervisor_gateway=None, explorer_gateway=None, planner_gateway=None,
+        recovery_max_read_bytes=1024, stop_event=stop, poll_interval_seconds=30,
+        on_result=receive)
+    assert len(seen) == 1 and seen[0]["outcome"] == "idle"
+    assert scan.call_count == 1 and scan.call_args.kwargs["stop_event"] is stop
+
+
+@pytest.mark.parametrize("interval", [0, -1, float("inf"), float("nan"), True])
+def test_recovery_loop_rejects_invalid_interval(tmp_path, interval):
+    worker = worker_module.Worker(None, "loop-worker")
+    with pytest.raises((TypeError, ValueError)):
+        worker.run_recovery_loop(
+            workspaces_root=tmp_path, artifacts_root=tmp_path,
+            supervisor_gateway=None, explorer_gateway=None, planner_gateway=None,
+            recovery_max_read_bytes=1024, stop_event=Event(), poll_interval_seconds=interval)
+
+
+def test_recovery_loop_propagates_scan_failure(tmp_path, monkeypatch):
+    worker = worker_module.Worker(None, "loop-worker")
+    monkeypatch.setattr(worker, "reclaim_next_expired_run", Mock(side_effect=RuntimeError("scan failed")))
+    with pytest.raises(RuntimeError, match="scan failed"):
+        worker.run_recovery_loop(
+            workspaces_root=tmp_path, artifacts_root=tmp_path,
+            supervisor_gateway=None, explorer_gateway=None, planner_gateway=None,
+            recovery_max_read_bytes=1024, stop_event=Event(), poll_interval_seconds=1)
 
 
 def test_resolve_run_directories_keeps_distinct_run_paths(tmp_path):

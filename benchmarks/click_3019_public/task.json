@@ -1,0 +1,83 @@
+{
+  "pack_id": "click-3019",
+  "schema_version": 1,
+  "title": "Click #3019: empty prompt_suffix adds a trailing space",
+  "source": {
+    "issue_url": "https://github.com/pallets/click/issues/3019",
+    "repository_url": "https://github.com/pallets/click",
+    "license": "BSD-3-Clause",
+    "issue_reference": "pallets/click#3019"
+  },
+  "base_commit": "00fadb8904387158ce6e9aa1573be770446895c1",
+  "environment": {
+    "python_requires": ">=3.10",
+    "dependencies": [
+      "pytest==9.1.1",
+      "colorama==0.4.6"
+    ],
+    "platform_notes": "The benchmark repository uses colorama on Windows. The public report used Python 3.13; the recorded local run used Python 3.11.15, so the two environments are not identical."
+  },
+  "issue": {
+    "sanitized_problem": "click.prompt and click.confirm emit one extra space when prompt_suffix is the empty string.",
+    "observable_error": "With prompt_suffix=\"\" the rendered prompt line carries a trailing space that an omitted suffix does not produce.",
+    "expected_behavior": "An empty prompt_suffix and an omitted prompt_suffix render the same prompt line."
+  },
+  "scope": {
+    "allowed_paths": [
+      "src/click/"
+    ],
+    "forbidden_paths": [
+      "benchmarks/"
+    ]
+  },
+  "public_checks": {
+    "command": [
+      "python",
+      "-B",
+      "-m",
+      "pytest",
+      "-q",
+      "-p",
+      "no:cacheprovider",
+      "scenarios.py"
+    ],
+    "command_name": "pytest",
+    "target_tests": [
+      "scenarios::test_prompt_suffix[empty-suffix]",
+      "scenarios::test_confirm_suffix[empty-suffix]"
+    ],
+    "pythonpath_relative": "src",
+    "notes": "PYTHONPATH and DEVFLOW_CLICK_SOURCE must point at the pinned commit's src so the checkout is exercised instead of any installed Click. Only the empty-suffix parameters are expected to fail; the space-suffix parameters are the environment control. Target tests are written in the form the JUnit parser produces (`module::test[param]`): the report records `classname` as the module stem without `.py`, and the comparison matches names exactly, so a pytest node id such as `scenarios.py::test_prompt_suffix` would never match a recorded result. The parameter ids come from the manual baseline recorded below; the first automatic run must confirm them before any formal acceptance claim."
+  },
+  "baseline": {
+    "status": "verified_here",
+    "recorded_at": "2026-11-12",
+    "environment_note": "Windows, Python 3.11.15, pytest 9.1.1, colorama 0.4.6 (preflight automatic public baseline on a clean checkout at this commit)",
+    "failed_targets": 2,
+    "passed_controls": 2,
+    "notes": "The 2026-11-09 manual observation and the 2026-11-12 automatic preflight run agree: two declared targets failed, two controls passed, exit code 1, and the checkout stayed unmodified. A preflight baseline is not a Run-persisted baseline: every Run must still record its own pre-patch failure before a patch is considered."
+  },
+  "policy": {
+    "policy_version": "benchmark-click3019-v1",
+    "model_id": "deepseek-flash"
+  },
+  "independent_suite": {
+    "suite_version": "click3019-private-v1",
+    "materials_sha256": "c108f73a2222591e15202ff14c46fb6702412bd1371e788a6e3d3962c0c62f40",
+    "digest_scope": "可信侧 material JSON 的完整原始 UTF-8 文件字节，包含末尾换行",
+    "digest_method": "对上述文件字节直接计算 SHA-256，输出小写十六进制",
+    "provided_by": "trusted_control_plane",
+    "declaration": "独立材料由可信控制端在仓库外保管并注入；实际校准中缺陷基准失败、参考版本通过。摘要用于标识材料，不单独证明来源、隔离或测试充分性。"
+  },
+  "unverified": [
+    {
+      "field": "environment",
+      "reason": "The report environment (Python 3.13) and the recorded run environment (Python 3.11.15) differ; reproducibility on one pinned interpreter is unconfirmed."
+    },
+    {
+      "field": "public_checks.target_tests",
+      "reason": "Parameter ids come from the manual baseline; no automatic run has yet confirmed that these declared names match the JUnit records."
+    }
+  ],
+  "external_connections": "none"
+}

@@ -96,15 +96,37 @@ def test_post_explorer_requires_explicit_route_goal(outcome):
         PostExplorerDecision.model_validate(decision)
 
 
-def test_post_explorer_prompt_distinguishes_preview_and_summary():
-    prompt = build_post_explorer_supervisor_prompt({"preview": "untrusted"})
-    assert "summary is a claim" in prompt and "truncated preview as partial" in prompt
+def test_post_explorer_prompt_matches_the_routing_view_it_receives():
+    """The prompt must not tell the Supervisor it is looking at source it never got."""
+    prompt = build_post_explorer_supervisor_prompt({"read_evidence": [], "already_read": []})
+
+    assert "summary is a claim" in prompt
+    # The routing view carries references and markers, no bodies: say so.
+    assert "not file contents" in prompt and "never claim to have read source" in prompt
+    assert "`truncated` means the tool cut the read" in prompt
+    assert "`preview_clipped` means the content placed in a model's prompt was cut" in prompt
+    assert "A complete tool read does not mean a model saw all of it" in prompt
+    # Reading a file before must never forbid re-reading it for clipped evidence.
+    assert "must never stop a re-read" in prompt
+    # And a gap deeper in a file already read is answered with a range, not the same head.
+    assert "line range (offset/limit)" in prompt
+    assert "covered line ranges merged" in prompt
+    # A total that was never observed is reported as unknown, not guessed.
+    assert "null means unknown, never a guess" in prompt
+    # The route can see whether there is budget for another exploration.
+    assert "remaining_model_tokens" in prompt
+    assert "Use the supplied read previews" not in prompt
 
 
 def test_post_planner_decision_and_prompt_distinguish_missing_evidence():
     decision = PostPlannerDecision.model_validate({"outcome": "RE_EXPLORE", "reason": "missing facts",
                                                     "next_goal": "find the caller"})
     assert decision.root.outcome == "RE_EXPLORE"
-    assert "NEEDS_EVIDENCE" in build_post_planner_supervisor_prompt({})
+    planner_prompt = build_post_planner_supervisor_prompt({})
+    assert "NEEDS_EVIDENCE" in planner_prompt
+    assert "not file contents" in planner_prompt
+    assert "`preview_clipped`" in planner_prompt and "`truncated`" in planner_prompt
+    assert "naming a line range" in planner_prompt
+    assert "remaining_model_tokens" in planner_prompt
     with pytest.raises(ValidationError):
         PostPlannerDecision.model_validate({"outcome": "CODE", "reason": "missing goal"})

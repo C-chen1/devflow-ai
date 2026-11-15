@@ -26,6 +26,7 @@ from devflow_ai.harness import (
     resolve_workspace_file,
 )
 from devflow_ai.policy import PolicyPermissions
+from devflow_ai.process_evidence import proves_process_not_started
 
 
 def test_baseline_workspace_requires_pinned_clean_git_state(tmp_path):
@@ -138,6 +139,36 @@ def test_registered_command_stops_a_timed_out_process(tmp_path):
             tmp_path, "test", registry={"test": (sys.executable, "-c", "import time; time.sleep(30)")},
             timeout_seconds=1, stop_event=Event(),
         )
+
+
+def test_only_the_process_boundary_can_prove_a_command_never_started(tmp_path):
+    """The proof comes from the spawn boundary, not from the exception type."""
+    with pytest.raises(ValueError, match="absolute executable") as rejected:
+        harness_module.run_registered_command(
+            tmp_path, "test", registry={"test": ("python", "-c", "print(1)")},
+            timeout_seconds=5, stop_event=Event(),
+        )
+    assert proves_process_not_started(rejected.value) is True
+
+    # A validation error raised in the same call shape, but after a child really ran,
+    # carries no proof: nothing may be concluded from its type alone.
+    result = harness_module.run_registered_command(
+        tmp_path, "test", registry={"test": (sys.executable, "-B", "-c", "print('started')")},
+        timeout_seconds=15, stop_event=Event(),
+    )
+    assert result.stdout.strip() == b"started"
+    try:
+        raise ValueError("absolute executable")
+    except ValueError as error:
+        assert proves_process_not_started(error) is False
+
+    # A command that started and then failed is a result, not a failure to start.
+    with pytest.raises(harness_module.GitCommandFailed) as failed:
+        harness_module.run_registered_command(
+            tmp_path, "test", registry={"test": (sys.executable, "-B", "-c", "raise SystemExit(2)")},
+            timeout_seconds=15, stop_event=Event(),
+        )
+    assert proves_process_not_started(failed.value) is False
 
 
 def test_patch_path_inspection_rejects_rename_and_unparseable_patch(tmp_path):
@@ -562,3 +593,94 @@ def test_read_text_file_saves_full_artifact_only_for_truncated_preview(
         assert path == artifact_root / f"{artifact_id}.bin"
         assert path.read_bytes() == content
         assert digest == sha256(content).hexdigest()
+
+
+def test_a_line_range_reads_the_requested_window_and_reports_coverage(tmp_path):
+    from devflow_ai.harness import read_text_file_range
+
+    body = "".join(f"line {number}\n" for number in range(1, 21))
+    (tmp_path / "core.py").write_bytes(body.encode("utf-8"))
+
+    middle = read_text_file_range(tmp_path, "core.py", start_line=10, line_limit=3, max_bytes=4096)
+    assert (middle.start_line, middle.end_line, middle.total_lines) == (10, 12, 20)
+    assert middle.text == "line 10\nline 11\nline 12\n"
+    assert middle.has_more is True and middle.byte_truncated is False
+
+    tail = read_text_file_range(tmp_path, "core.py", start_line=18, line_limit=5, max_bytes=4096)
+    assert (tail.start_line, tail.end_line, tail.total_lines) == (18, 20, 20)
+    # Reaching the end does not make it the whole file: it started at line 18.
+    assert tail.has_more is False
+
+    whole = read_text_file_range(tmp_path, "core.py", start_line=1, line_limit=20, max_bytes=4096)
+    assert whole.has_more is False and whole.text == body
+    assert (whole.end_line, whole.total_lines, whole.partial_line) == (20, 20, False)
+
+    beyond = read_text_file_range(tmp_path, "core.py", start_line=50, line_limit=3, max_bytes=4096)
+    assert (beyond.text, beyond.end_line, beyond.has_more) == ("", 0, False)
+
+
+def test_a_line_range_respects_the_byte_limit_and_the_workspace_boundary(tmp_path):
+    from devflow_ai.harness import read_text_file_range
+
+    (tmp_path / "core.py").write_bytes(b"aaaaaaaaaa\nbbbbbbbbbb\ncccccccccc\n")
+
+    capped = read_text_file_range(tmp_path, "core.py", start_line=1, line_limit=3, max_bytes=12)
+    # The second line does not fit: a bounded prefix is returned and marked partial, rather
+    # than being dropped and leaving the caller with less than it asked for.
+    assert capped.byte_truncated is True and capped.has_more is True
+    assert capped.text == "aaaaaaaaaa\nb"
+    assert (capped.end_line, capped.partial_line) == (2, True)
+
+    with pytest.raises(WorkspacePathError):
+        read_text_file_range(tmp_path, "../outside.py", start_line=1, line_limit=1, max_bytes=64)
+    with pytest.raises(ValueError):
+        read_text_file_range(tmp_path, "core.py", start_line=0, line_limit=1, max_bytes=64)
+    with pytest.raises(ValueError):
+        read_text_file_range(tmp_path, "core.py", start_line=1, line_limit=0, max_bytes=64)
+
+
+def test_a_single_line_longer_than_the_byte_budget_returns_a_bounded_prefix(tmp_path):
+    """A huge line must not produce an empty preview, and must not be buffered whole."""
+    from devflow_ai.harness import read_text_file_range
+
+    huge = "x" * 200_000
+    (tmp_path / "minified.js").write_bytes(f"short\n{huge}\n".encode("utf-8"))
+
+    result = read_text_file_range(tmp_path, "minified.js", start_line=2, line_limit=1, max_bytes=1024)
+
+    assert len(result.text) == 1024
+    assert (result.start_line, result.end_line, result.total_lines) == (2, 2, 2)
+    assert result.byte_truncated is True and result.partial_line is True
+    assert result.has_more is True
+
+
+def test_partial_only_line_has_unread_content(tmp_path):
+    from devflow_ai.harness import read_text_file_range
+
+    (tmp_path / "single.txt").write_bytes(b"abcdefghij")
+    result = read_text_file_range(tmp_path, "single.txt", start_line=1, line_limit=1, max_bytes=4)
+
+    assert result.text == "abcd"
+    assert result.byte_truncated and result.partial_line and result.has_more
+
+
+def test_a_range_that_ends_without_a_newline_still_returns_the_last_line(tmp_path):
+    from devflow_ai.harness import read_text_file_range
+
+    (tmp_path / "tail.txt").write_bytes(b"one\ntwo\nthree")
+
+    result = read_text_file_range(tmp_path, "tail.txt", start_line=3, line_limit=1, max_bytes=64)
+
+    assert result.text == "three"
+    assert (result.end_line, result.total_lines, result.has_more) == (3, 3, False)
+
+
+def test_a_range_that_fits_exactly_is_not_marked_truncated(tmp_path):
+    from devflow_ai.harness import read_text_file_range
+
+    (tmp_path / "exact.txt").write_bytes(b"12345\n")
+
+    result = read_text_file_range(tmp_path, "exact.txt", start_line=1, line_limit=1, max_bytes=6)
+
+    assert result.text == "12345\n"
+    assert result.byte_truncated is False and result.partial_line is False

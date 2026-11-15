@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 from devflow_ai.artifacts import ToolArtifactResult, write_artifact_file
 from devflow_ai.enums import AgentRole
 from devflow_ai.policy import PolicyPermissions
+from devflow_ai.process_evidence import mark_process_not_started
 import subprocess
 
 if platform_name == "nt":
@@ -196,10 +197,15 @@ def _start_git_process(
         env["PYTHONPATH"] = str(pythonpath)
     if platform_name == "nt":
         return start_windows_job_process(command, cwd=cwd, env=env, stdout=stdout, stderr=stderr)
-    process = subprocess.Popen(
-        command, shell=False, cwd=cwd, env=env,
-        stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-    )
+    try:
+        process = subprocess.Popen(
+            command, shell=False, cwd=cwd, env=env,
+            stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+        )
+    except OSError as error:
+        # Popen raising means no child process exists. This is the only place that can
+        # say so; handlers elsewhere must treat an unmarked error as unknown.
+        raise mark_process_not_started(error)
     return nullcontext(process)
 
 
@@ -230,11 +236,13 @@ def _run_managed_process(
     artifact_root: Path | None = None, pythonpath: Path | None = None,
 ) -> GitCommandResult:
     if timeout_seconds <= 0:
-        raise ValueError("timeout_seconds must be positive")
+        raise mark_process_not_started(ValueError("timeout_seconds must be positive"))
     if max_stdout_bytes <= 0 or max_stderr_bytes <= 0:
-        raise ValueError("Git output preview limits must be positive")
+        raise mark_process_not_started(ValueError("Git output preview limits must be positive"))
     with TemporaryFile() as stdout_file, TemporaryFile() as stderr_file:
         if stop_event is not None and stop_event.is_set():
+            # A cancellation is not a failure of the command and proves nothing about a
+            # process, so it is left unmarked rather than reported as a failed start.
             raise GitExecutionCancelledError("Git execution cancelled before process start")
         deadline = monotonic() + timeout_seconds
         process_kwargs = {"cwd": cwd, "stdout": stdout_file, "stderr": stderr_file}
@@ -275,6 +283,27 @@ def run_registered_command(
     pythonpath_relative: str | None = None,
 ) -> GitCommandResult:
     """Execute a trusted registry entry without shell parsing or agent-supplied arguments."""
+    try:
+        command, root, pythonpath = _resolve_registered_command(
+            workspace_root, command_name, registry=registry, stop_event=stop_event,
+            pythonpath_relative=pythonpath_relative,
+        )
+    except BaseException as error:
+        # Everything above the spawn point runs here, so a failure at this stage is the
+        # boundary's own proof that no process was created.
+        raise mark_process_not_started(error)
+    return _run_managed_process(
+        list(command), cwd=root, timeout_seconds=timeout_seconds, stop_event=stop_event,
+        artifact_root=artifact_root, max_stdout_bytes=max_stdout_bytes, pythonpath=pythonpath,
+    )
+
+
+def _resolve_registered_command(
+    workspace_root: Path, command_name: str, *,
+    registry: Mapping[str, tuple[str, ...]], stop_event: Event,
+    pythonpath_relative: str | None,
+) -> tuple[tuple[str, ...], Path, Path | None]:
+    """Validate one registered command before anything is started."""
     command = registry.get(command_name)
     if command is None:
         raise ValueError("Command is not registered")
@@ -301,10 +330,7 @@ def run_registered_command(
         if (not pythonpath.is_dir() or not pythonpath.is_relative_to(root)
                 or any(part.casefold() == ".git" for part in pythonpath.relative_to(root).parts)):
             raise WorkspacePathError("Python source path must be a workspace directory")
-    return _run_managed_process(
-        list(command), cwd=root, timeout_seconds=timeout_seconds, stop_event=stop_event,
-        artifact_root=artifact_root, max_stdout_bytes=max_stdout_bytes, pythonpath=pythonpath,
-    )
+    return command, root, pythonpath
 
 
 @dataclass(frozen=True)
@@ -587,6 +613,132 @@ def read_text_file(
 def _decode_text(data: bytes, *, truncated: bool) -> str:
     decoder = getincrementaldecoder("utf-8")(errors="strict")
     return decoder.decode(data, final=not truncated)
+
+
+@dataclass(frozen=True)
+class TextRangeRead:
+    """One line range of a text file, with what is needed to judge its coverage.
+
+    ``total_lines`` is counted in the same pass; ``partial_line`` says the last line was cut
+    by the byte budget rather than ending where the file does.
+    """
+
+    text: str
+    start_line: int
+    end_line: int          # 0 when the range started past the end of the file
+    total_lines: int
+    has_more: bool         # lines exist after end_line
+    byte_truncated: bool   # the requested range did not fit in max_bytes
+    partial_line: bool = False
+
+
+_RANGE_CHUNK_BYTES = 64 * 1024
+
+
+def _iter_bounded_lines(source: BinaryIO, *, keep_bytes: int):
+    """Yield ``(content, complete)`` per line without ever holding a whole huge line.
+
+    ``content`` is the line (with its newline), cut to what still fits in ``keep_bytes``;
+    ``complete`` is False when the line was longer than that, in which case the rest of the
+    line is skipped without being buffered. Reading is chunked, so a file with one enormous
+    line does not blow up memory.
+    """
+    prefix = bytearray()
+    skipping = False
+    while True:
+        chunk = source.read(_RANGE_CHUNK_BYTES)
+        if not chunk:
+            if prefix or skipping:
+                yield bytes(prefix), not skipping
+            return
+        position = 0
+        while True:
+            newline = chunk.find(b"\n", position)
+            if newline < 0:
+                piece = chunk[position:]
+                if not skipping:
+                    room = keep_bytes - len(prefix)
+                    if room > 0:
+                        prefix.extend(piece[:room])
+                    if len(piece) > max(room, 0):
+                        skipping = True
+                break
+            piece = chunk[position:newline + 1]
+            if not skipping:
+                room = keep_bytes - len(prefix)
+                if room > 0:
+                    prefix.extend(piece[:room])
+                if len(piece) > max(room, 0):
+                    skipping = True
+            yield bytes(prefix), not skipping
+            prefix.clear()
+            skipping = False
+            position = newline + 1
+
+
+def read_text_file_range(
+    workspace_root: Path, relative_path: str, *, start_line: int, line_limit: int, max_bytes: int,
+) -> TextRangeRead:
+    """Return one 1-based line range of a file, bounded in bytes as well as in lines.
+
+    The path boundary is the same one every other read uses (``resolve_workspace_file``), so a
+    range cannot reach outside the workspace. A single line longer than the byte budget is
+    returned as a bounded prefix with ``partial_line=True`` instead of being dropped, because
+    an empty preview would leave the caller with nothing to move forward on.
+    """
+    if start_line < 1 or line_limit < 1 or max_bytes <= 0:
+        raise ValueError("Line range and byte limit must be positive")
+    collected: list[bytes] = []
+    used = 0
+    total = 0
+    end_line = 0
+    byte_truncated = False
+    partial_line = False
+    collecting = True
+    with _open_workspace_file(workspace_root, relative_path, max_bytes=max_bytes) as source:
+        for content, complete in _iter_bounded_lines(source, keep_bytes=max_bytes):
+            total += 1
+            if not collecting or total < start_line:
+                continue
+            remaining = max_bytes - used
+            if complete and len(content) <= remaining:
+                collected.append(content)
+                used += len(content)
+                end_line = total
+                if total - start_line + 1 >= line_limit:
+                    collecting = False
+                continue
+            # Either the line is longer than the whole budget, or what is left of the budget
+            # cannot hold it: keep a bounded prefix and say so.
+            take = content[:max(remaining, 0)]
+            if take:
+                collected.append(take)
+                used += len(take)
+                end_line = total
+                partial_line = not complete or len(take) < len(content)
+            byte_truncated = True
+            collecting = False
+    text = _decode_text(b"".join(collected), truncated=byte_truncated or partial_line)
+    return TextRangeRead(
+        text=text, start_line=start_line, end_line=end_line, total_lines=total,
+        # `has_more` means "there is content after what you just read"; a window that started
+        # past the end read nothing, so it has nothing more to offer.
+        has_more=end_line > 0 and (partial_line or end_line < total),
+        byte_truncated=byte_truncated, partial_line=partial_line,
+    )
+
+
+def copy_workspace_file_to_artifact(
+    workspace_root: Path, relative_path: str, *, artifact_root: Path, artifact_id: UUID,
+    max_bytes: int, chunk_size: int,
+) -> tuple[Path, str]:
+    """Save the whole file as an artifact when only part of it could be shown.
+
+    Same path boundary as every other read; this only preserves the bytes that a preview cut
+    off, so the evidence stays complete without widening what a caller can see.
+    """
+    with _open_workspace_file(workspace_root, relative_path, max_bytes=max_bytes) as source:
+        return write_artifact_file(artifact_root, artifact_id, source, chunk_size=chunk_size)
 
 
 def read_text_file_with_artifact(

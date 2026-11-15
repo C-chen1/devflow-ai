@@ -1,0 +1,78 @@
+{
+  "pack_id": "click-3084",
+  "schema_version": 1,
+  "title": "Click #3084: is_flag=False with flag_value requires an argument",
+  "source": {
+    "issue_url": "https://github.com/pallets/click/issues/3084",
+    "repository_url": "https://github.com/pallets/click",
+    "license": "BSD-3-Clause",
+    "issue_reference": "pallets/click#3084"
+  },
+  "base_commit": "7f7bbe4569ea68e8dabee232eade069ef3310aea",
+  "environment": {
+    "python_requires": ">=3.10",
+    "dependencies": [
+      "pytest==9.1.1",
+      "colorama==0.4.6"
+    ],
+    "platform_notes": "正式候选环境是 Windows + Python 3.11.15 + pytest 9.1.1 + colorama 0.4.6（Codex 已在该环境复核公开基线）。Linux 侧的复现另记：Python 3.11.17 + pytest 9.2.0，两套环境的结果分别记录，不互相替代。colorama 只在 Windows 上需要。"
+  },
+  "issue": {
+    "sanitized_problem": "An option declared with is_flag=False and flag_value=<value> no longer accepts the flag without an explicit value, so the documented 'optional value' form is gone.",
+    "observable_error": "Passing the option alone exits with SystemExit(2) and 'Error: Option --name requires an argument.' instead of using the declared flag_value.",
+    "expected_behavior": "Passing the option without a value uses flag_value, an explicit value wins when given, and the default applies when the option is absent."
+  },
+  "scope": {
+    "allowed_paths": [
+      "src/click/"
+    ],
+    "forbidden_paths": [
+      "benchmarks/"
+    ]
+  },
+  "public_checks": {
+    "command": [
+      "python",
+      "-B",
+      "-m",
+      "pytest",
+      "-q",
+      "-p",
+      "no:cacheprovider",
+      "scenarios.py"
+    ],
+    "command_name": "pytest",
+    "target_tests": [
+      "scenarios::test_flag_value_used_when_the_flag_is_given_alone"
+    ],
+    "pythonpath_relative": "src",
+    "notes": "Targets are written in the form the JUnit parser records (module::test[param]): the report uses the module stem without .py, so a pytest node id such as scenarios.py::test_x would never match. The two non-target tests are environment controls: they pass before and after the fix, so a failure there means the harness or the checkout is wrong, not that the defect is present. PYTHONPATH must point at the pinned checkout's src so the checkout is exercised instead of any installed Click."
+  },
+  "baseline": {
+    "status": "verified_here",
+    "recorded_at": "2026-11-13",
+    "environment_note": "Windows，Python 3.11.15，pytest 9.1.1，colorama 0.4.6：基准 commit 1 failed / 2 passed，退出码 1，目标 JUnit 名称匹配；参考修复 3 passed。Linux（Python 3.11.17 / pytest 9.2.0）得到同样结论，两次记录分别保留、不拼接。",
+    "failed_targets": 1,
+    "passed_controls": 2,
+    "notes": "两个浅仓库（base 7f7bbe4569ea68e8dabee232eade069ef3310aea / fix 955ca492a6b9e8de0660dae1c415568ca6f9c4b3）由 Codex 在 Windows 上解包核对：HEAD、tree、144 个跟踪文件、git fsck 与工作区干净均通过。它们来自第三方代理（沙箱到 github.com:443 不通），对象按 SHA-1 寻址且 tree 与上游 API 一致，但“经代理取得”不等于“从可信 checkout 取得”，正式运行仍以可信侧 checkout 为准。每次真实 Run 仍必须自己记录补丁前失败。"
+  },
+  "external_connections": "none",
+  "policy": {
+    "policy_version": "benchmark-click3084-v1",
+    "model_id": "deepseek-flash"
+  },
+  "independent_suite": {
+    "suite_version": "click3084-private-v1",
+    "materials_sha256": "a25ed3a4a82e3a3b453e45163f7f96408eebb7289c336dbe48e21c1cbc924d97",
+    "digest_scope": "可信侧 material JSON 的完整原始 UTF-8 文件字节，包含末尾换行",
+    "digest_method": "对上述文件字节直接计算 SHA-256，输出小写十六进制",
+    "provided_by": "trusted_control_plane",
+    "declaration": "独立材料由可信控制端在仓库外保管并注入；离线校准中缺陷基准失败、参考版本通过。摘要用于标识材料，不单独证明来源、隔离或测试充分性。"
+  },
+  "unverified": [
+    {
+      "field": "base_commit",
+      "reason": "commit 与工作区已由 Codex 在 Windows 核对，但两个浅仓库经第三方代理取得；正式运行仍以可信侧自己的 checkout 为准。"
+    }
+  ]
+}

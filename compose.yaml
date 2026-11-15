@@ -16,5 +16,99 @@ services:
       retries: 10
       start_period: 10s
 
+  # API 只读数据库连接配置，启动时不建表、不升级：迁移必须显式执行（见 migrate）。
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: devflow-api:local
+    environment:
+      DEVFLOW_DB_USER: ${DEVFLOW_DB_USER}
+      DEVFLOW_DB_PASSWORD: ${DEVFLOW_DB_PASSWORD}
+      DEVFLOW_DB_NAME: ${DEVFLOW_DB_NAME}
+      # 容器内走 Compose 网络，库名固定为 db:5432；5434 只是宿主机映射端口。
+      DEVFLOW_DB_HOST: db
+      DEVFLOW_DB_PORT: "5432"
+    ports:
+      # 只发布到宿主机回环地址，不对外暴露。
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # 显式迁移入口。列在 tools profile 下，`docker compose up` 默认不会启动它；
+  # 默认命令只是只读查看当前版本，升级需要显式给出 revision：
+  #   docker compose --env-file .env run --rm migrate
+  #   docker compose --env-file .env run --rm migrate upgrade head
+  migrate:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: devflow-api:local
+    environment:
+      DEVFLOW_DB_USER: ${DEVFLOW_DB_USER}
+      DEVFLOW_DB_PASSWORD: ${DEVFLOW_DB_PASSWORD}
+      DEVFLOW_DB_NAME: ${DEVFLOW_DB_NAME}
+      DEVFLOW_DB_HOST: db
+      DEVFLOW_DB_PORT: "5432"
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ["alembic"]
+    command: ["current"]
+
+  # 一次性 Worker 执行入口：执行**调用方指定**的一个 Task 的 Run，不领取队列里的任意 Task。
+  # 列在 worker profile 下，默认 up 不启动；默认命令只打印帮助，因此误跑也不会改数据库：
+  #   docker compose --env-file .env run --rm worker --help
+  #   docker compose --env-file .env run --rm -v <pack>:/packs/<pack>:ro \
+  #       -v <work>:/work worker --pack /packs/<pack> --task-id <uuid> ... --confirm-run
+  # 它执行 Agent 阶段但不写基准记录、不写正式 Verification；正式验收仍走可信入口。
+  worker:
+    profiles: ["worker"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: devflow-api:local
+    environment:
+      DEVFLOW_DB_USER: ${DEVFLOW_DB_USER}
+      DEVFLOW_DB_PASSWORD: ${DEVFLOW_DB_PASSWORD}
+      DEVFLOW_DB_NAME: ${DEVFLOW_DB_NAME}
+      DEVFLOW_DB_HOST: db
+      DEVFLOW_DB_PORT: "5432"
+      # 模型网关只在真正调用时读取；缺失时入口以配置错误退出（2），值从不打印。
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEVFLOW_DEEPSEEK_MODEL: ${DEVFLOW_DEEPSEEK_MODEL:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ["python", "-m", "devflow_ai.worker_run"]
+    command: ["--help"]
+
+  # 调度入口：默认是有限批次（跑完登记项即退出），加 --watch 才是常驻模式。
+  # 同样列在 worker profile 下，默认命令只打印帮助；清单由调用时挂载：
+  #   docker compose --env-file .env run --rm -v <manifest.json>:/config/manifest.json:ro \
+  #       scheduler --manifest /config/manifest.json ... --confirm-run
+  #   ... --watch           # 常驻：按 --poll-interval-seconds 重读清单，停止信号才退出
+  scheduler:
+    profiles: ["worker"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: devflow-api:local
+    environment:
+      DEVFLOW_DB_USER: ${DEVFLOW_DB_USER}
+      DEVFLOW_DB_PASSWORD: ${DEVFLOW_DB_PASSWORD}
+      DEVFLOW_DB_NAME: ${DEVFLOW_DB_NAME}
+      DEVFLOW_DB_HOST: db
+      DEVFLOW_DB_PORT: "5432"
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEVFLOW_DEEPSEEK_MODEL: ${DEVFLOW_DEEPSEEK_MODEL:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ["python", "-m", "devflow_ai.worker_scheduler"]
+    command: ["--help"]
+
 volumes:
   devflow_pgdata:

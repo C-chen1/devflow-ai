@@ -1,10 +1,12 @@
 from collections.abc import Callable
+from typing import Literal
 from uuid import UUID
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict, Field
-from devflow_ai.enums import TaskStatus
-from devflow_ai.models import Task
+from devflow_ai.enums import RunStatus, TaskStatus, VerificationResult
+from devflow_ai.models import Run, Task, TaskReview, Verification
 from devflow_ai.policy import PolicyConfig, build_default_policy, build_policy_snapshot
 from devflow_ai.repositories import TaskRepository
 from devflow_ai.admission_claim import AdmissionClaim, AdmissionClaimService, AdmissionClaimDeniedError
@@ -123,3 +125,124 @@ class TaskService:
                     f"Task {task_id} is {task.status.value}; admission requires PENDING"
                 )
         return task
+
+
+class TaskReviewError(ValueError):
+    """The review cannot be recorded as submitted."""
+
+
+class TaskReviewConflictError(TaskReviewError):
+    """The Task already carries a different review."""
+
+
+class TaskReviewEvidenceError(TaskReviewError):
+    """The Run or the Verification does not support this review."""
+
+
+class TaskReviewService:
+    """Record one human review and move the Task in the same transaction.
+
+    The review is bound to a specific Task, Run, formal Verification and run-record digest.
+    A repeated submission of the same record is idempotent; a different record or a different
+    conclusion is refused instead of guessed. The Task row is locked for the whole decision,
+    so two reviewers cannot both win.
+    """
+
+    def __init__(self, session: Session):
+        self.session = session
+        self.task_repository = TaskRepository(session)
+
+    def record(
+        self, *, task_id: UUID, run_id: UUID, verification_id: UUID, record_sha256: str,
+        conclusion: Literal["accepted", "rejected"], reviewer: str, reviewed_at: str,
+        independent_suite_version: str | None,
+    ) -> dict:
+        """Record one review, binding it to the evidence it claims to have reviewed.
+
+        The record names the independent suite version it was produced against; the
+        Verification it cites carries the suite version the trusted evaluation actually ran.
+        They must agree — a review that cannot say which suite it saw is not evidence, and the
+        check runs on every submission, including an idempotent replay, so a replay cannot slip
+        past it.
+        """
+        if conclusion not in ("accepted", "rejected"):
+            raise TaskReviewError("A review conclusion must be accepted or rejected")
+        if not reviewer.strip() or not reviewed_at.strip():
+            raise TaskReviewError("A review needs a reviewer and a review time")
+        if not isinstance(record_sha256, str) or len(record_sha256) != 64 \
+                or any(character not in "0123456789abcdef" for character in record_sha256):
+            raise TaskReviewError("A record digest must be a full sha256 in lower-case hex")
+        declared_suite = (independent_suite_version or "").strip()
+        if not declared_suite:
+            raise TaskReviewEvidenceError(
+                "The review does not declare the independent suite version it was made against")
+        with self.session.begin():
+            task = self.session.scalar(select(Task).where(Task.id == task_id).with_for_update())
+            if task is None:
+                raise TaskNotFoundError(f"Task {task_id} does not exist")
+            run = self.session.scalar(select(Run).where(
+                Run.id == run_id, Run.task_id == task_id).with_for_update())
+            if run is None:
+                raise TaskReviewEvidenceError("The Run does not belong to this Task")
+            if run.status != RunStatus.PASSED:
+                raise TaskReviewEvidenceError(
+                    f"The Run is {run.status.value}, not a passed attempt")
+            verification = self.session.scalar(select(Verification).where(
+                Verification.id == verification_id, Verification.run_id == run_id))
+            if verification is None:
+                raise TaskReviewEvidenceError("The Verification does not belong to this Run")
+            if verification.result != VerificationResult.PASSED:
+                raise TaskReviewEvidenceError("The Verification did not pass")
+            evidence = verification.evidence or {}
+            if evidence.get("scope") != "trusted_v1":
+                raise TaskReviewEvidenceError(
+                    "The Verification is not trusted-scope evidence")
+            recorded_suite = str(evidence.get("suite_version") or "").strip()
+            if not recorded_suite:
+                raise TaskReviewEvidenceError(
+                    "The Verification does not record which independent suite it ran")
+            if recorded_suite != declared_suite:
+                raise TaskReviewEvidenceError(
+                    "The review declares suite version "
+                    f"{declared_suite!r} but the Verification records {recorded_suite!r}")
+            existing = self.session.scalar(select(TaskReview).where(
+                TaskReview.task_id == task_id, TaskReview.record_sha256 == record_sha256))
+            if existing is not None:
+                # Idempotent only for the same submission. The digest identifies the record,
+                # but the rest of what was bound to it must match too, or this is a different
+                # review wearing the same record.
+                differing = [
+                    name for name, submitted, stored in (
+                        ("run", run_id, existing.run_id),
+                        ("verification", verification_id, existing.verification_id),
+                        ("conclusion", conclusion, existing.conclusion),
+                        ("reviewer", reviewer.strip(), existing.reviewer),
+                        ("reviewed_at", reviewed_at.strip(), existing.reviewed_at),
+                    ) if submitted != stored
+                ]
+                if differing:
+                    raise TaskReviewConflictError(
+                        "This record was already reviewed with different content: "
+                        + ", ".join(differing))
+                return self._result(existing, task, idempotent=True)
+            other = self.session.scalar(select(TaskReview).where(TaskReview.task_id == task_id))
+            if other is not None:
+                raise TaskReviewConflictError("This Task was already reviewed with another record")
+            if task.status != TaskStatus.AWAITING_REVIEW:
+                raise TaskStateConflictError(
+                    f"Task {task_id} is {task.status.value}, not awaiting review")
+            review = TaskReview(
+                task_id=task_id, run_id=run_id, verification_id=verification_id,
+                record_sha256=record_sha256, conclusion=conclusion,
+                reviewer=reviewer.strip(), reviewed_at=reviewed_at.strip(),
+            )
+            self.session.add(review)
+            self.session.flush()
+            task.status = (TaskStatus.COMPLETED if conclusion == "accepted"
+                           else TaskStatus.REJECTED)
+            return self._result(review, task, idempotent=False)
+
+    @staticmethod
+    def _result(review: TaskReview, task: Task, *, idempotent: bool) -> dict:
+        return {"review_id": str(review.id), "conclusion": review.conclusion,
+                "task_status": task.status.value, "idempotent": idempotent}

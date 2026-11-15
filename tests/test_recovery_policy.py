@@ -47,6 +47,19 @@ def test_unknown_rediagnosis_history_does_not_pretend_to_be_zero_or_over_limit()
     assert exhausted.decision == "escalate" and "retry_limit" in exhausted.reasons
 
 
+def test_zero_rediagnosis_budget_is_exhausted_even_when_count_is_unknown():
+    unknown = facts(category=FailureCategory.UNKNOWN_FAILURE, rediagnoses_started=None)
+    result = assess_recovery_policy(PolicyBudget(max_rediagnose_attempts=0), unknown)
+    assert result.decision == "escalate" and result.reasons == ("rediagnose_limit",)
+    result = assess_recovery_policy(PolicyBudget(max_rediagnose_attempts=1), unknown)
+    assert result.decision == "undetermined" and result.reasons == ("rediagnose_count_unknown",)
+    assert assess_recovery_policy(PolicyBudget(max_rediagnose_attempts=1),
+                                  facts(category=FailureCategory.UNKNOWN_FAILURE, rediagnoses_started=0)).decision == "allow_recovery"
+    result = assess_recovery_policy(PolicyBudget(max_rediagnose_attempts=1),
+                                    facts(category=FailureCategory.UNKNOWN_FAILURE, rediagnoses_started=1))
+    assert result.decision == "escalate" and result.reasons == ("rediagnose_limit",)
+
+
 def test_recovery_rejects_invalid_counts():
     with pytest.raises(ValidationError):
         facts(signature_occurrences=0)

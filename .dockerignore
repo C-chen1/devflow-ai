@@ -1,0 +1,15 @@
+# 镜像只需要 pyproject.toml、uv.lock、alembic.ini、migrations 与 src；
+# 这里排除的内容既不进镜像，也不进构建上下文。
+.git
+.github
+.venv
+.idea
+.pytest_cache
+**/__pycache__
+.env
+.env.test
+.env.example
+.python-version
+docs
+tests
+benchmarks

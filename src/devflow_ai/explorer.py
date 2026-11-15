@@ -1,6 +1,6 @@
 from collections.abc import Callable
 from typing import Literal, TypeVar
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from devflow_ai.context import ReadEvidenceRef
 from devflow_ai.coordinator import ReadFileReceipt, ToolCallBudgetExceededError
 from devflow_ai.enums import AgentExecutionStatus, ToolCallStatus
@@ -18,9 +18,14 @@ class ExplorerResult(BaseModel):
 
 
 class ExplorerReadRequest(BaseModel):
+    """One read request: a whole file, or a line range of a file that is too large to send."""
+
     model_config = ConfigDict(extra="forbid")
 
     path: NonBlankText
+    # 1-based first line and how many lines to read. Omit both for the head-of-file read.
+    offset: int | None = Field(default=None, ge=1)
+    limit: int | None = Field(default=None, ge=1)
 
 
 class ExplorerReport(BaseModel):
@@ -64,10 +69,15 @@ def explore_one_file(
     try:
         choice = ask(
             ExplorerReadRequest,
-            "Select one relevant repository-relative file path for read_file.",
+            "Select one relevant repository-relative file path for read_file. If the file is "
+            "large and the fact you need sits deeper in it, give offset (1-based first line) and "
+            "limit (how many lines) to read that range instead of the file head again. "
+            "`already_read` lists each file already read in this Run with its covered line ranges "
+            "(merged, so overlapping windows appear once): ask for the range that is still missing "
+            "rather than repeating a covered one.",
             agent_input,
         )
-        receipt = read_file(choice.path)
+        receipt = read_file(choice.path, choice.offset, choice.limit)
         if receipt.status != ToolCallStatus.SUCCEEDED:
             return failed("EXPLORER_READ_UNAVAILABLE", tool_call_id=str(receipt.tool_call_id))
         reference = ReadEvidenceRef(path=choice.path, tool_call_id=receipt.tool_call_id)
@@ -81,6 +91,14 @@ def explore_one_file(
                     **reference.model_dump(mode="json"),
                     "preview": receipt.preview,
                     "truncated": receipt.truncated,
+                    **({"offset": choice.offset} if choice.offset is not None else {}),
+                    **({"limit": choice.limit} if choice.limit is not None else {}),
+                    # What was actually read, when the receipt recorded it. Unknown values are
+                    # left out rather than guessed from the request.
+                    **{key: getattr(receipt, key) for key in (
+                        "start_line", "end_line", "total_lines", "has_more",
+                        "byte_truncated", "partial_line")
+                       if getattr(receipt, key) is not None},
                 },
             },
         )

@@ -20,6 +20,8 @@ from devflow_ai.context import AgentReadEvidenceError, ReadEvidenceRef, resolve_
 from devflow_ai.database import get_database_time
 from devflow_ai.enums import AgentExecutionStatus, AgentRole, FailureCategory, RunStatus, TaskStatus, ToolCallStatus, VerificationResult
 from devflow_ai.harness import (
+    copy_workspace_file_to_artifact,
+    read_text_file_range,
     GitCommandFailed,
     GitCommandTimedOut,
     GitExecutionCancelledError,
@@ -44,6 +46,7 @@ from devflow_ai.harness import (
 from devflow_ai.models import AgentExecution, Artifact, FailureRecord, Handoff, Run, Task, ToolCall, Verification
 from devflow_ai.policy import PolicyConfig
 from devflow_ai.planner import PlanReady, PlannerOutput
+from devflow_ai.process_evidence import proves_process_not_started
 from devflow_ai.repositories import RunRepository, TaskRepository, ToolCallRepository
 from devflow_ai.runtime_environment import PythonEnvironmentObservation
 from devflow_ai.services import TaskNotFoundError, TaskStateConflictError
@@ -51,16 +54,31 @@ from devflow_ai.verifier import (
     SemanticReviewDraft, VerifierEvidenceSelection, VerificationEvidenceError, VerificationReadiness,
     build_verifier_semantic_context, load_semantic_review_draft, parse_git_numstat,
     validate_semantic_read_history, validate_semantic_review_citations, load_independent_evaluation,
-    preliminary_public_outcome, build_failure_observations, load_pytest_report_artifact,
+    preliminary_public_outcome, build_failure_observations, load_pytest_report_artifact, TestComparison,
 )
 from devflow_ai.workspace_lock import WorkspaceLockReceipt, workspace_operation_lock
-from devflow_ai.verification_config import VerificationConfig
+from devflow_ai.verification_config import (
+    VerificationConfig, command_evidence_sha256, copied_public_tests_sha256, expected_command_evidence,
+)
 from devflow_ai.independent_evaluation import PrivateCase, calibrate_stdio_suite, evaluate_stdio_candidate
 from devflow_ai.supervisor import VerificationFailureProposal, resolve_verification_failure_evidence
-from devflow_ai.recovery_policy import (RecoveryFacts, RecoveryHistory, assess_recovery_policy,
+from devflow_ai.recovery_policy import (RecoveryAssessment, RecoveryFacts, RecoveryHistory,
+                                        assess_recovery_policy,
                                         public_failure_signature, semantic_failure_signature)
 
 ToolOutput = TypeVar("ToolOutput")
+
+# Every lease expiry in one Task shares this signature: it names the event class,
+# not a proven common root cause, so it only bounds repeated rediagnosis budget.
+LEASE_EXPIRED_SIGNATURE = "lease-expired:v1"
+
+# Tools whose effect on the workspace cannot be replayed or assumed absent.
+# Mirrors the quarantine list used by workspace_operation_lock.
+_MUTATING_TOOL_NAMES = ("git_clone", "git_checkout", "apply_patch", "run_command")
+
+# A failed tool call may only be recorded as a clean failure when the process-creation
+# boundary marked the error as proof that no process was started. Exception types are
+# not evidence: a ValueError can be raised after a child already exists.
 
 
 class RunCreationConflictError(ValueError):
@@ -180,6 +198,9 @@ class ToolCallResult(BaseModel):
     duration_ms: int | None = None
     reason: str | None = None
     artifacts: tuple[ToolArtifactResult, ...] = ()
+    # What the tool actually observed, when that differs from what was requested. Persisted
+    # next to the request (``args["observed"]``) so evidence can tell "asked for" from "got".
+    observed: dict | None = None
 
 
 class ReadFileReceipt(BaseModel):
@@ -194,6 +215,16 @@ class ReadFileReceipt(BaseModel):
     artifact_ids: tuple[UUID, ...]
     reason: str | None
     ends_with_newline: bool | None = None
+    # What was asked for.
+    requested_offset: int | None = None
+    requested_limit: int | None = None
+    # What was actually read. Unknown values stay None instead of being inferred.
+    start_line: int | None = None
+    end_line: int | None = None
+    total_lines: int | None = None
+    has_more: bool | None = None
+    byte_truncated: bool | None = None
+    partial_line: bool | None = None
 
 
 class LeaseRenewal(BaseModel):
@@ -215,9 +246,17 @@ class RunCoordinator:
         self.run_repository = RunRepository(session)
 
     def start_initial_run(
-        self, task_id: UUID, worker_id: str, creation_idempotency_key: str,
+        self, task_id: UUID, worker_id: str, creation_idempotency_key: str, *,
+        expected_base_commit: str | None = None,
+        expected_policy: PolicyConfig | None = None,
     ) -> tuple[Run, bool]:
-        """Commit an initial Run or replay its result; replay grants no new lease."""
+        """Commit an initial Run or replay its result; replay grants no new lease.
+
+        ``expected_base_commit`` and ``expected_policy`` are re-checked **inside** the Task
+        row lock, in the same transaction that creates the Run. A caller that checked the
+        Task before asking for the claim therefore cannot create a Run from assumptions
+        that the Task has since contradicted; a mismatch is a state conflict, not a Run.
+        """
         for name, value in (
             ("worker_id", worker_id),
             ("creation_idempotency_key", creation_idempotency_key),
@@ -237,7 +276,10 @@ class RunCoordinator:
                         if self.task_repository.get_by_id(task_id, populate_existing=True) is None:
                             raise TaskNotFoundError(f"Task {task_id} not found")
                         raise TaskClaimBusyError(f"Task {task_id} is locked; retry the same creation request")
-                    run = self._create_initial_run(task, worker_id, creation_idempotency_key)
+                    run = self._create_initial_run(
+                        task, worker_id, creation_idempotency_key,
+                        expected_base_commit=expected_base_commit,
+                        expected_policy=expected_policy)
                     created = True
         return run, created
 
@@ -252,6 +294,14 @@ class RunCoordinator:
                 # This call produces a new creation intent for the selected Task.
                 run = self._create_initial_run(task, worker_id, str(uuid4()))
         return run
+
+    @staticmethod
+    def _rediagnosis_plan_available(policy: PolicyConfig) -> bool:
+        """A rediagnosis Run can only begin when Explorer can read and has a Run budget."""
+        return ("read_file" in policy.permissions.allowed_tools_by_role.get(AgentRole.EXPLORER, ())
+                and policy.budget.max_graph_steps_per_run >= 4
+                and policy.budget.max_tool_calls_per_run >= 1
+                and policy.budget.max_llm_tokens_per_run >= 1)
 
     def start_retry_run(self, task_id: UUID, worker_id: str, creation_idempotency_key: str) -> tuple[Run, bool]:
         """Create one policy-authorized implementation retry or replay its existing receipt."""
@@ -299,14 +349,150 @@ class RunCoordinator:
                     lease_seconds = min(self.lease_config.lease_duration_seconds, policy.budget.max_run_duration_seconds)
                     run = Run(task_id=task_id, attempt_number=len(runs) + 1, status=RunStatus.RUNNING,
                         creation_idempotency_key=creation_idempotency_key, worker_id=worker_id,
+                        recovery_action="REVISE_IMPLEMENTATION",
                         started_at=database_time, last_heartbeat_at=database_time,
                         lease_expires_at=database_time + timedelta(seconds=lease_seconds))
                     self.run_repository.add(run)
                     task.status = TaskStatus.RUNNING
                     created = True
+            if run.recovery_action not in (None, "REVISE_IMPLEMENTATION"):
+                raise RunCreationConflictError("A rediagnosis Run creation key cannot identify a retry")
             if run.attempt_number == 1:
                 raise RunCreationConflictError("An initial Run creation key cannot identify a retry")
         return run, created
+
+    def start_rediagnosis_run(
+        self, task_id: UUID, worker_id: str, creation_idempotency_key: str,
+    ) -> tuple[Run, bool]:
+        """Create one UNKNOWN_FAILURE rediagnosis reservation and its action marker atomically.
+
+        Creation is not a start and does not consume the rediagnosis count; the
+        actual-start event is committed separately before the first node runs.
+        As with other Task claims, a currently locked Task reports TaskClaimBusyError;
+        the caller retries the same creation key, and a committed Run is replayed.
+        """
+        for value in (worker_id, creation_idempotency_key):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("worker_id and creation_idempotency_key must be nonblank")
+        with self.session.begin():
+            run = self._get_replay(task_id, worker_id, creation_idempotency_key)
+            created = False
+            if run is None:
+                task = self.task_repository.get_by_id_for_update(task_id)
+                run = self._get_replay(task_id, worker_id, creation_idempotency_key)
+                if run is None:
+                    if task is None:
+                        if self.task_repository.get_by_id(task_id, populate_existing=True) is None:
+                            raise TaskNotFoundError(f"Task {task_id} not found")
+                        raise TaskClaimBusyError(f"Task {task_id} is locked; retry the same creation request")
+                    if task.status != TaskStatus.RETRYING:
+                        raise TaskStateConflictError("Rediagnosis Run requires a RETRYING Task")
+                    policy = PolicyConfig.model_validate(task.policy_snapshot)
+                    if policy.policy_version != task.policy_version:
+                        raise ValueError("Task policy_version does not match its policy_snapshot")
+                    runs = self.session.scalars(select(Run).where(Run.task_id == task_id)
+                                                .order_by(Run.attempt_number)).all()
+                    if (not runs or [item.attempt_number for item in runs] != list(range(1, len(runs) + 1))
+                            or any(item.status != RunStatus.FAILED for item in runs)):
+                        raise RecoveryDecisionUnavailableError("Rediagnosis history is incomplete or inconsistent")
+                    last = runs[-1]
+                    failures = self.session.scalars(select(FailureRecord).where(FailureRecord.run_id == last.id)).all()
+                    verification = self.session.scalars(select(Verification).where(Verification.run_id == last.id,
+                        Verification.result == VerificationResult.FAILED)).all()
+                    if (len(failures) != 1 or len(verification) != 1
+                            or failures[0].category != FailureCategory.UNKNOWN_FAILURE
+                            or failures[0].recovery_action != "REDIAGNOSE"):
+                        raise RecoveryDecisionUnavailableError(
+                            "A verified UNKNOWN_FAILURE rediagnosis decision is required")
+                    history = self._read_recovery_history(last, failures[0].signature)
+                    started, reserved, untracked = self._read_rediagnosis_usage(task_id)
+                    if history.rediagnoses_started is None or untracked:
+                        raise RecoveryDecisionUnavailableError("Rediagnosis start history is unknown")
+                    if history.failed_runs_without_record:
+                        raise RecoveryDecisionUnavailableError("Rediagnosis history has unrecorded failures")
+                    signature_occurrences = self.session.scalar(select(func.count(func.distinct(Run.id))).select_from(
+                        FailureRecord).join(Run, FailureRecord.run_id == Run.id).where(
+                            Run.task_id == task_id, Run.status == RunStatus.FAILED,
+                            FailureRecord.signature == failures[0].signature))
+                    assessment = assess_recovery_policy(policy.budget, RecoveryFacts(
+                        category=FailureCategory.UNKNOWN_FAILURE,
+                        retries_started=history.retries_started,
+                        signature_occurrences=max(1, signature_occurrences or 0),
+                        # Pending tracked Runs reserve budget until they start or
+                        # become terminal, so creation cannot exceed the quota.
+                        rediagnoses_started=started + reserved,
+                        has_compliant_plan=self._rediagnosis_plan_available(policy),
+                        has_new_information_or_strategy=True, transient_retry_safe=False))
+                    if assessment.decision != "allow_recovery":
+                        raise RecoveryDecisionUnavailableError(
+                            "Rediagnosis policy or history no longer permits recovery")
+                    database_time = get_database_time(self.session)
+                    lease_seconds = min(self.lease_config.lease_duration_seconds,
+                                        policy.budget.max_run_duration_seconds)
+                    run = Run(task_id=task_id, attempt_number=len(runs) + 1, status=RunStatus.RUNNING,
+                        creation_idempotency_key=creation_idempotency_key, worker_id=worker_id,
+                        recovery_action="REDIAGNOSE", recovery_start_tracking="v1",
+                        started_at=database_time, last_heartbeat_at=database_time,
+                        lease_expires_at=database_time + timedelta(seconds=lease_seconds))
+                    self.run_repository.add(run)
+                    task.status = TaskStatus.RUNNING
+                    created = True
+            if run.recovery_action != "REDIAGNOSE":
+                raise RunCreationConflictError("Another recovery action cannot identify a rediagnosis Run")
+            if run.attempt_number == 1:
+                raise RunCreationConflictError("An initial Run creation key cannot identify a rediagnosis")
+        return run, created
+
+    def begin_rediagnosis_start(self, run_id: UUID, worker_id: str) -> bool:
+        """Atomically record the start of a rediagnosis Run's first node before dispatch.
+
+        The event is the Run's recovery_started_at timestamp. Repeating it for the
+        same Run is a no-op. Task and Run row locks serialise the quota check;
+        pending tracked Runs count as reservations, so a crash between Run
+        creation and this commit cannot let later Runs exceed the budget.
+        """
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise ValueError("worker_id must be a non-blank string")
+        with self.session.begin():
+            run = self.run_repository.get_by_id_for_update(run_id)
+            if run is None or run.status != RunStatus.RUNNING or run.worker_id != worker_id:
+                raise RunExecutionDeniedError(f"Run {run_id} is not eligible for this worker")
+            if run.recovery_action != "REDIAGNOSE":
+                raise RunExecutionDeniedError("Only a rediagnosis Run can record this start")
+            if run.recovery_start_tracking != "v1":
+                raise RecoveryDecisionUnavailableError("Rediagnosis start history is unknown")
+            task = self.session.scalar(select(Task).where(Task.id == run.task_id).with_for_update())
+            if task is None or task.status != TaskStatus.RUNNING:
+                raise RunExecutionDeniedError(f"Run {run_id} Task is not RUNNING")
+            policy = PolicyConfig.model_validate(task.policy_snapshot)
+            if policy.policy_version != task.policy_version:
+                raise ValueError("Task policy_version does not match its policy_snapshot")
+            hard_deadline = run.started_at + timedelta(seconds=policy.budget.max_run_duration_seconds)
+            database_time = get_database_time(self.session)
+            if database_time >= run.lease_expires_at or database_time >= hard_deadline:
+                raise RunExecutionDeniedError(f"Run {run_id} lease or duration budget has expired")
+            if run.recovery_started_at is not None:
+                return False
+            # The marker must precede the first execution, so activity without one
+            # is an untracked legacy or inconsistent Run and cannot be counted safely.
+            has_activity = self.session.scalar(select(exists().where(AgentExecution.run_id == run_id)))
+            if has_activity:
+                raise RecoveryDecisionUnavailableError(
+                    "Rediagnosis activity exists without a durable start record")
+            started, reserved, untracked = self._read_rediagnosis_usage(run.task_id)
+            legacy_recoveries = self.session.scalar(select(func.count()).select_from(Run).where(
+                Run.task_id == run.task_id, Run.attempt_number > 1, Run.recovery_action.is_(None))) or 0
+            incomplete = self.session.scalar(select(func.count()).select_from(Run).where(
+                Run.task_id == run.task_id, Run.status == RunStatus.FAILED,
+                ~exists().where(FailureRecord.run_id == Run.id))) or 0
+            if untracked or legacy_recoveries or incomplete:
+                raise RecoveryDecisionUnavailableError("Rediagnosis start history is unknown")
+            if (started + reserved > policy.budget.max_rediagnose_attempts
+                    or not self._rediagnosis_plan_available(policy)):
+                raise RecoveryDecisionUnavailableError(
+                    "Rediagnosis policy or history no longer permits recovery")
+            run.recovery_started_at = database_time
+        return True
 
     def renew_lease(self, run_id: UUID, worker_id: str) -> LeaseRenewal:
         """Commit an owned, live lease renewal; database failures propagate unchanged."""
@@ -336,41 +522,51 @@ class RunCoordinator:
         handoff_id: UUID | None = None,
     ) -> UUID:
         """Commit one RUNNING AgentExecution and return its ID."""
+        with self.session.begin():
+            return self._start_agent_execution_in_transaction(
+                run_id, worker_id, role=role, agent_input=agent_input, handoff_id=handoff_id,
+            )
+
+    def _start_agent_execution_in_transaction(
+        self, run_id: UUID, worker_id: str, *, role: AgentRole, agent_input: dict,
+        handoff_id: UUID | None = None,
+    ) -> UUID:
+        """Create one RUNNING AgentExecution within an existing transaction and return its ID."""
+        if not self.session.in_transaction():
+            raise RuntimeError("Agent execution creation requires a caller-owned transaction")
         role = AgentRole(role)
         if not isinstance(agent_input, dict):
             raise ValueError("agent_input must be an object")
-        with self.session.begin():
-            _, policy = self._lock_and_check_execution_right(run_id, worker_id)
-            if handoff_id is not None:
-                matching_handoff = self.session.scalar(
-                    select(Handoff.id)
-                    .join(AgentExecution, Handoff.from_agent_execution_id == AgentExecution.id)
-                    .where(
-                        Handoff.id == handoff_id,
-                        Handoff.to_agent_role == role.value.lower(),
-                        AgentExecution.run_id == run_id,
-                    ),
-                )
-                if matching_handoff is None:
-                    raise HandoffApprovalError("Handoff must match the receiving Run and Agent role")
-                existing_execution_id = self.session.scalar(
-                    select(AgentExecution.id).where(AgentExecution.handoff_id == handoff_id),
-                )
-                if existing_execution_id is not None:
-                    raise HandoffAlreadyStartedError(handoff_id, existing_execution_id)
-            used_steps = self.session.scalar(
-                select(func.count()).select_from(AgentExecution).where(AgentExecution.run_id == run_id),
+        _, policy = self._lock_and_check_execution_right(run_id, worker_id)
+        if handoff_id is not None:
+            matching_handoff = self.session.scalar(
+                select(Handoff.id)
+                .join(AgentExecution, Handoff.from_agent_execution_id == AgentExecution.id)
+                .where(
+                    Handoff.id == handoff_id,
+                    Handoff.to_agent_role == role.value.lower(),
+                    AgentExecution.run_id == run_id,
+                ),
             )
-            if used_steps >= policy.budget.max_graph_steps_per_run:
-                raise GraphStepBudgetExceededError(f"Run {run_id} has exhausted its graph step budget")
-            execution = AgentExecution(
-                run_id=run_id, agent_role=role.value.lower(),
-                status=AgentExecutionStatus.RUNNING, input=agent_input, handoff_id=handoff_id,
+            if matching_handoff is None:
+                raise HandoffApprovalError("Handoff must match the receiving Run and Agent role")
+            existing_execution_id = self.session.scalar(
+                select(AgentExecution.id).where(AgentExecution.handoff_id == handoff_id),
             )
-            self.session.add(execution)
-            self.session.flush()
-            execution_id = execution.id
-        return execution_id
+            if existing_execution_id is not None:
+                raise HandoffAlreadyStartedError(handoff_id, existing_execution_id)
+        used_steps = self.session.scalar(
+            select(func.count()).select_from(AgentExecution).where(AgentExecution.run_id == run_id),
+        )
+        if used_steps >= policy.budget.max_graph_steps_per_run:
+            raise GraphStepBudgetExceededError(f"Run {run_id} has exhausted its graph step budget")
+        execution = AgentExecution(
+            run_id=run_id, agent_role=role.value.lower(),
+            status=AgentExecutionStatus.RUNNING, input=agent_input, handoff_id=handoff_id,
+        )
+        self.session.add(execution)
+        self.session.flush()
+        return execution.id
 
     def finish_agent_execution(
         self, run_id: UUID, worker_id: str, *, agent_execution_id: UUID,
@@ -488,6 +684,35 @@ class RunCoordinator:
                 execution.output = {**(output or {}), "approved_handoff_id": str(handoff_id)}
         return handoff_id
 
+    def model_token_budget(self, run_id: UUID, policy: PolicyConfig) -> dict:
+        """Report how the Run's model budget has been spent, without changing anything.
+
+        Settled requests count their reported usage; unsettled ones count the reservation
+        they hold, exactly as the reservation path does. Legacy usage without per-request
+        records makes the remaining amount unknowable, which is reported rather than guessed.
+        """
+        executions = self.session.scalars(
+            select(AgentExecution).where(AgentExecution.run_id == run_id)
+            .options(load_only(AgentExecution.id, AgentExecution.llm_usage))
+            .execution_options(populate_existing=True),
+        ).all()
+        limit = policy.budget.max_llm_tokens_per_run
+        used = 0
+        unsettled = 0
+        for item in executions:
+            if item.llm_usage and "model_requests" not in item.llm_usage:
+                return {"limit": limit, "used": None, "unsettled": None,
+                        "remaining": None, "legacy_usage": True}
+            for entry in (item.llm_usage or {}).get("model_requests", {}).values():
+                actual = entry["actual_usage"]
+                if actual is None:
+                    used += entry["reserved_tokens"]
+                    unsettled += 1
+                else:
+                    used += actual["input_tokens"] + actual["output_tokens"]
+        return {"limit": limit, "used": used, "unsettled": unsettled,
+                "remaining": max(0, limit - used), "legacy_usage": False}
+
     def reserve_model_request(
         self, run_id: UUID, worker_id: str, *, agent_execution_id: UUID,
         estimated_input_tokens: int, max_output_tokens: int,
@@ -568,11 +793,64 @@ class RunCoordinator:
         self, run_id: UUID, worker_id: str, *,
         agent_execution_id: UUID, workspace_root: Path, relative_path: str, max_bytes: int,
         artifact_root: Path | None = None, artifact_chunk_size: int = 64 * 1024,
-        stop_event: Event | None = None,
+        stop_event: Event | None = None, start_line: int | None = None, line_limit: int | None = None,
     ) -> UUID:
-        """Execute an audited read with the worker's trusted workspace and byte limit."""
+        """Execute an audited read with the worker's trusted workspace and byte limit.
+
+        A caller may ask for a line range (``start_line``, ``line_limit``) instead of the head of
+        the file. The path boundary, the role permission and the byte limit are unchanged; the
+        requested window is recorded in the tool call's args so the evidence says which lines
+        were actually read. ``OUTPUT_TRUNCATED`` keeps its meaning: this result is not the whole
+        file (either the range excludes part of it, or the bytes ran out).
+        """
+        if (start_line is not None and start_line < 1) or (line_limit is not None and line_limit < 1):
+            raise ValueError("Line range must be positive")
+        ranged = start_line is not None or line_limit is not None
+        window = (int(start_line if start_line is not None else 1),
+                  int(line_limit if line_limit is not None else 1))
+
         def execute(_: UUID) -> ToolCallResult:
             artifacts: tuple[ToolArtifactResult, ...] = ()
+            if ranged:
+                try:
+                    read = read_text_file_range(
+                        workspace_root, relative_path, start_line=window[0], line_limit=window[1],
+                        max_bytes=max_bytes,
+                    )
+                except WorkspacePathError:
+                    return ToolCallResult(status=ToolCallStatus.DENIED, reason="WORKSPACE_PATH_DENIED")
+                except WorkspaceFileNotFoundError:
+                    return ToolCallResult(status=ToolCallStatus.FAILED, reason="FILE_NOT_FOUND")
+                except UnicodeDecodeError:
+                    return ToolCallResult(status=ToolCallStatus.FAILED, reason="INVALID_UTF8")
+                if "\x00" in read.text:
+                    return ToolCallResult(status=ToolCallStatus.FAILED, reason="UNSUPPORTED_TEXT_CONTENT")
+                if read.byte_truncated and artifact_root is not None:
+                    # A range cut by the byte limit keeps the same guarantee as a head read:
+                    # the bytes that were not shown are still saved as an artifact.
+                    try:
+                        artifact_id = uuid4()
+                        path, digest = copy_workspace_file_to_artifact(
+                            workspace_root, relative_path, artifact_root=artifact_root,
+                            artifact_id=artifact_id, max_bytes=max_bytes,
+                            chunk_size=artifact_chunk_size)
+                    except WorkspacePathError:
+                        return ToolCallResult(status=ToolCallStatus.DENIED, reason="WORKSPACE_PATH_DENIED")
+                    except WorkspaceFileNotFoundError:
+                        return ToolCallResult(status=ToolCallStatus.FAILED, reason="FILE_NOT_FOUND")
+                    artifacts = (ToolArtifactResult(
+                        id=artifact_id, kind="tool_output",
+                        content_ref=str(path.absolute()), content_hash=digest),)
+                whole_file = read.start_line == 1 and not read.has_more and not read.byte_truncated
+                return ToolCallResult(
+                    status=ToolCallStatus.SUCCEEDED, stdout_excerpt=read.text,
+                    reason=None if whole_file else "OUTPUT_TRUNCATED", artifacts=artifacts,
+                    observed={
+                        "start_line": read.start_line, "end_line": read.end_line,
+                        "total_lines": read.total_lines, "has_more": read.has_more,
+                        "byte_truncated": read.byte_truncated, "partial_line": read.partial_line,
+                    },
+                )
             try:
                 if artifact_root is None:
                     text, truncated = read_text_file(workspace_root, relative_path, max_bytes=max_bytes)
@@ -601,11 +879,21 @@ class RunCoordinator:
                 return ToolCallResult(
                     status=ToolCallStatus.FAILED, reason="UNSUPPORTED_TEXT_CONTENT", artifacts=artifacts,
                 )
+            lines_seen = text.count("\n") + (
+                1 if text and not text.endswith("\n") else 0)
             return ToolCallResult(
                 status=ToolCallStatus.SUCCEEDED,
                 stdout_excerpt=text,
                 reason="OUTPUT_TRUNCATED" if truncated else None,
                 artifacts=artifacts,
+                # A head read does not scan the file, so the total is only known when the
+                # preview already reached the end. Unknown stays null rather than guessed.
+                observed={
+                    "start_line": 1, "end_line": lines_seen,
+                    "total_lines": None if truncated else lines_seen,
+                    "has_more": bool(truncated), "byte_truncated": bool(truncated),
+                    "partial_line": bool(truncated) and bool(text) and not text.endswith("\n"),
+                },
             )
 
         with workspace_operation_lock(
@@ -613,7 +901,11 @@ class RunCoordinator:
         ) as workspace_receipt:
             return self.execute_agent_tool_call(
                 run_id, worker_id, agent_execution_id=agent_execution_id,
-                tool_name="read_file", args={"path": relative_path},
+                tool_name="read_file", args={
+                    "path": relative_path,
+                    **({"offset": window[0]} if ranged else {}),
+                    **({"limit": window[1]} if ranged else {}),
+                },
                 registered_tools={"read_file"}, execute=execute,
                 stop_event=stop_event, workspace_receipt=workspace_receipt,
             )
@@ -622,16 +914,18 @@ class RunCoordinator:
         self, run_id: UUID, worker_id: str, *,
         agent_execution_id: UUID, workspace_root: Path, relative_path: str, max_bytes: int,
         artifact_root: Path, artifact_chunk_size: int = 64 * 1024, stop_event: Event | None = None,
+        start_line: int | None = None, line_limit: int | None = None,
     ) -> ReadFileReceipt:
         """Read and audit the file, then build a receipt from committed records."""
         call_id = self.execute_read_file(
             run_id, worker_id, agent_execution_id=agent_execution_id,
             workspace_root=workspace_root, relative_path=relative_path, max_bytes=max_bytes,
             artifact_root=artifact_root, artifact_chunk_size=artifact_chunk_size, stop_event=stop_event,
+            start_line=start_line, line_limit=line_limit,
         )
         with self.session.begin():
             call = self.session.execute(
-                select(ToolCall.status, ToolCall.stdout_excerpt, ToolCall.reason).where(
+                select(ToolCall.status, ToolCall.stdout_excerpt, ToolCall.reason, ToolCall.args).where(
                     ToolCall.id == call_id,
                     ToolCall.run_id == run_id,
                     ToolCall.agent_execution_id == agent_execution_id,
@@ -640,12 +934,20 @@ class RunCoordinator:
             artifact_ids = tuple(self.session.scalars(
                 select(Artifact.id).where(Artifact.tool_call_id == call_id).order_by(Artifact.id),
             ))
+            request = call.args if isinstance(call.args, dict) else {}
+            observed = request.get("observed") if isinstance(request.get("observed"), dict) else {}
             receipt = ReadFileReceipt(
                 tool_call_id=call_id, status=call.status, preview=call.stdout_excerpt,
                 truncated=call.reason == "OUTPUT_TRUNCATED",
                 artifact_ids=artifact_ids, reason=call.reason,
                 ends_with_newline=(call.stdout_excerpt.endswith("\n") if call.status == ToolCallStatus.SUCCEEDED
                     and call.stdout_excerpt is not None and call.reason != "OUTPUT_TRUNCATED" else None),
+                requested_offset=(request.get("offset") if isinstance(request.get("offset"), int) else None),
+                requested_limit=(request.get("limit") if isinstance(request.get("limit"), int) else None),
+                start_line=observed.get("start_line"), end_line=observed.get("end_line"),
+                total_lines=observed.get("total_lines"), has_more=observed.get("has_more"),
+                byte_truncated=observed.get("byte_truncated"),
+                partial_line=observed.get("partial_line"),
             )
         return receipt
 
@@ -749,6 +1051,7 @@ class RunCoordinator:
         pythonpath_relative: str | None = None,
         require_unpatched: bool = False,
         verify_baseline: bool = False,
+        public_tests_sha256: Mapping[str, str] | None = None,
     ) -> UUID:
         """Execute one server-registered command for a Verifier with an audited result."""
         if stop_event is None:
@@ -883,9 +1186,12 @@ class RunCoordinator:
         command = registry.get(command_name)
         command_hash = None
         if isinstance(command, tuple) and command and all(isinstance(part, str) and part for part in command):
-            hashed_value = command if pythonpath_relative is None else {"command": command, "pythonpath": pythonpath_relative}
-            command_hash = sha256(json.dumps(hashed_value, ensure_ascii=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            command_hash = command_evidence_sha256(command, pythonpath_relative)
         args = {"command_name": command_name, "command_sha256": command_hash}
+        if public_tests_sha256 is not None:
+            # Digest of the copy that was executed, so acceptance can compare it with the
+            # trusted pack rather than trusting that the path still holds those bytes.
+            args["public_tests_sha256"] = dict(sorted(public_tests_sha256.items()))
         if verify_baseline:
             args["baseline_workspace_checked"] = True
         if pythonpath_relative is not None:
@@ -1143,15 +1449,8 @@ class RunCoordinator:
                 if verification_config is not None:
                     config = VerificationConfig.model_validate(verification_config.model_dump())
                     task = self.session.scalar(select(Task).join(Run, Run.task_id == Task.id).where(Run.id == run_id))
-                    call = self.session.get(ToolCall, draft.selection.current_call_id)
-                    hashed_value = (config.command if config.pythonpath_relative is None else
-                                    {"command": config.command, "pythonpath": config.pythonpath_relative})
-                    digest = sha256(json.dumps(hashed_value, ensure_ascii=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-                    if (task is None or task.id != config.task_id or task.base_commit != config.base_commit
-                            or draft.selection.command_name != config.command_name
-                            or draft.selection.target_tests != config.target_tests or call is None
-                            or call.args.get("command_sha256") != digest):
-                        raise VerificationEvidenceError("Verification config does not match the recorded evidence")
+                    self._require_matching_command_evidence(
+                        config, task=task, draft=draft, artifact_root=artifact_root)
                 context, comparison = build_verifier_semantic_context(
                     self.session, run_id, agent_execution_id, selection=draft.selection,
                     artifact_root=artifact_root, max_diff_bytes=max_diff_bytes, max_patch_bytes=max_patch_bytes,
@@ -1195,6 +1494,19 @@ class RunCoordinator:
             run = self.session.get(Run, run_id)
             return self._read_recovery_history(run, signature)
 
+    def _read_rediagnosis_usage(self, task_id: UUID) -> tuple[int, int, bool]:
+        """Return started, RUNNING pending, and untracked legacy rediagnosis counts."""
+        rediagnoses = (Run.task_id == task_id, Run.recovery_action == "REDIAGNOSE")
+        untracked = self.session.scalar(select(func.count()).select_from(Run).where(
+            *rediagnoses, Run.recovery_start_tracking.is_(None))) or 0
+        started = self.session.scalar(select(func.count()).select_from(Run).where(
+            *rediagnoses, Run.recovery_start_tracking == "v1",
+            Run.recovery_started_at.is_not(None))) or 0
+        reserved = self.session.scalar(select(func.count()).select_from(Run).where(
+            *rediagnoses, Run.recovery_start_tracking == "v1",
+            Run.recovery_started_at.is_(None), Run.status == RunStatus.RUNNING)) or 0
+        return int(started), int(reserved), bool(untracked)
+
     def _read_recovery_history(self, run: Run, signature: str) -> RecoveryHistory:
         run_count = self.session.scalar(select(func.count()).select_from(Run).where(Run.task_id == run.task_id))
         prior_matches = self.session.scalar(select(func.count(func.distinct(Run.id))).select_from(FailureRecord).join(
@@ -1203,8 +1515,19 @@ class RunCoordinator:
         has_record = exists().where(FailureRecord.run_id == Run.id)
         incomplete = self.session.scalar(select(func.count()).select_from(Run).where(
             Run.task_id == run.task_id, Run.status == RunStatus.FAILED, ~has_record))
+        # A legacy recovery Run has no action marker, so its action cannot be
+        # reconstructed safely. Do not turn that unknown into zero or REDIAGNOSE.
+        legacy_recoveries = self.session.scalar(select(func.count()).select_from(Run).where(
+            Run.task_id == run.task_id, Run.attempt_number > 1, Run.recovery_action.is_(None)))
+        rediagnoses_started = None
+        if not legacy_recoveries:
+            started, _, untracked = self._read_rediagnosis_usage(run.task_id)
+            if not untracked:
+                rediagnoses_started = started
         return RecoveryHistory(retries_started=max(0, run_count - 1),
-            previous_signature_occurrences=prior_matches, failed_runs_without_record=incomplete)
+            previous_signature_occurrences=prior_matches, failed_runs_without_record=incomplete,
+            rediagnoses_started=rediagnoses_started)
+
 
     def prepare_recovery_evidence(self, run_id: UUID, worker_id: str, *, supervisor_execution_id: UUID,
         artifact_root: Path, max_diff_bytes: int, max_patch_bytes: int, stop_event: Event) -> dict:
@@ -1297,6 +1620,88 @@ class RunCoordinator:
                 execution.output = {"outcome": "FAILURE_CLASSIFICATION_PROPOSED", **proposal.model_dump(mode="json")}
                 execution.status = AgentExecutionStatus.SUCCEEDED
 
+    def _require_matching_command_evidence(
+        self, config: VerificationConfig, *, task: Task | None, draft, artifact_root: Path,
+    ) -> tuple[ToolCall | None, ToolCall | None]:
+        """Return the current and baseline calls only if they match the trusted config.
+
+        The digest is derived by the same helper the Worker uses to assemble the command
+        that actually runs, so execution and acceptance cannot disagree about what was
+        checked. Public test content is pinned twice: the digest recorded at execution
+        must equal the trusted pack's, and the copy still on disk must too.
+        """
+        try:
+            expected = expected_command_evidence(config, artifact_root)
+        except (ValueError, OSError) as error:
+            raise VerificationEvidenceError("Trusted public checks are no longer readable") from error
+        call = self.session.get(ToolCall, draft.selection.current_call_id)
+        baseline_call = self.session.get(ToolCall, draft.selection.baseline_call_id)
+        if (task is None or task.id != config.task_id or task.base_commit != config.base_commit
+                or draft.selection.command_name != config.command_name
+                or draft.selection.target_tests != config.target_tests or call is None):
+            raise VerificationEvidenceError("Verification config does not match the recorded evidence")
+        if call.args.get("command_sha256") != expected.command_sha256:
+            raise VerificationEvidenceError("Executed command does not match the trusted configuration")
+        # Content is pinned per file, so the baseline and the post-patch run cannot have
+        # executed different test bytes that happen to sit at the same path.
+        expected_tests = expected.public_tests_sha256 or None
+        if (call.args.get("public_tests_sha256") or None) != expected_tests:
+            raise VerificationEvidenceError("Public test content does not match the trusted pack")
+        if baseline_call is not None and (
+                baseline_call.args.get("public_tests_sha256") or None) != expected_tests:
+            raise VerificationEvidenceError("Baseline public test content does not match the trusted pack")
+        if expected.public_tests_sha256 and (
+                copied_public_tests_sha256(artifact_root) != expected.public_tests_sha256):
+            raise VerificationEvidenceError("Public test copy no longer matches the trusted pack")
+        return call, baseline_call
+
+    def _validate_finalizable_failure(
+        self, run_id: UUID, *, task: Task, supervisor_execution_id: UUID, config: VerificationConfig,
+        artifact_root: Path, max_diff_bytes: int, max_patch_bytes: int,
+    ) -> tuple[VerificationFailureProposal, SemanticReviewDraft, dict, TestComparison, str, dict]:
+        """Reconstruct the committed failure and derive its concrete signature."""
+        supervisor = self.session.scalar(select(AgentExecution).where(
+            AgentExecution.id == supervisor_execution_id, AgentExecution.run_id == run_id,
+            AgentExecution.agent_role == AgentRole.SUPERVISOR.value.lower(),
+            AgentExecution.status == AgentExecutionStatus.SUCCEEDED))
+        if supervisor is None or (supervisor.output or {}).get("outcome") != "FAILURE_CLASSIFICATION_PROPOSED":
+            raise VerificationEvidenceError("Committed failure classification is unavailable")
+        try:
+            proposal = VerificationFailureProposal.model_validate(
+                {k: v for k, v in supervisor.output.items() if k != "outcome"})
+            data = supervisor.input
+            verifier_id, draft_id = UUID(data["verifier_execution_id"]), UUID(data["draft_artifact_id"])
+            independent_id = UUID(data["independent_artifact_id"]) if data.get("independent_artifact_id") else None
+        except (ValueError, KeyError, TypeError, ValidationError):
+            raise VerificationEvidenceError("Failure classification is invalid") from None
+        observations = build_failure_observations(self.session, run_id, verifier_id,
+            draft_artifact_id=draft_id, independent_artifact_id=independent_id, artifact_root=artifact_root,
+            max_diff_bytes=max_diff_bytes, max_patch_bytes=max_patch_bytes)
+        if observations != data.get("observations"):
+            raise VerificationEvidenceError("Failure observations changed after classification")
+        resolve_verification_failure_evidence(proposal, observations)
+        draft = load_semantic_review_draft(self.session, run_id, verifier_id,
+            artifact_id=draft_id, artifact_root=artifact_root)
+        context, comparison = build_verifier_semantic_context(self.session, run_id, verifier_id,
+            selection=draft.selection, artifact_root=artifact_root,
+            max_diff_bytes=max_diff_bytes, max_patch_bytes=max_patch_bytes)
+        _, baseline_call = self._require_matching_command_evidence(
+            config, task=task, draft=draft, artifact_root=artifact_root)
+        if (baseline_call is None or baseline_call.args.get("baseline_workspace_checked") is not True
+                or preliminary_public_outcome(comparison, draft.review).value != "failed"):
+            raise VerificationEvidenceError("Configured tests, baseline or failure do not match")
+        signature = None
+        if proposal.evidence_refs == ("semantic_review",):
+            signature = semantic_failure_signature(draft.review)
+        elif proposal.evidence_refs == ("public_tests",):
+            report = load_pytest_report_artifact(self.session, run_id, verifier_id,
+                tool_call_id=draft.selection.current_call_id, artifact_id=draft.selection.current_artifact_id,
+                artifact_root=artifact_root, expected_command_name=draft.selection.command_name)
+            signature = public_failure_signature(report, comparison)
+        if signature is None:
+            raise RecoveryDecisionUnavailableError("A specific failure signature is unavailable")
+        return proposal, draft, context, comparison, signature, data
+
     def finalize_implementation_failure(
         self, run_id: UUID, worker_id: str, *, supervisor_execution_id: UUID,
         verification_config: VerificationConfig, workspace_root: Path, artifact_root: Path,
@@ -1314,52 +1719,14 @@ class RunCoordinator:
                 task = self.session.scalar(select(Task).where(Task.id == run.task_id).with_for_update())
                 if task is None or task.id != config.task_id or task.base_commit != config.base_commit or task.status != TaskStatus.RUNNING:
                     raise VerificationEvidenceError("Task or base does not match verification configuration")
-                supervisor = self.session.scalar(select(AgentExecution).where(
-                    AgentExecution.id == supervisor_execution_id, AgentExecution.run_id == run_id,
-                    AgentExecution.agent_role == AgentRole.SUPERVISOR.value.lower(),
-                    AgentExecution.status == AgentExecutionStatus.SUCCEEDED))
-                if supervisor is None or (supervisor.output or {}).get("outcome") != "FAILURE_CLASSIFICATION_PROPOSED":
-                    raise VerificationEvidenceError("Committed failure classification is unavailable")
-                try:
-                    proposal = VerificationFailureProposal.model_validate({k: v for k, v in supervisor.output.items() if k != "outcome"})
-                    data = supervisor.input
-                    verifier_id, draft_id = UUID(data["verifier_execution_id"]), UUID(data["draft_artifact_id"])
-                    independent_id = UUID(data["independent_artifact_id"]) if data.get("independent_artifact_id") else None
-                except (ValueError, KeyError, TypeError, ValidationError):
-                    raise VerificationEvidenceError("Failure classification is invalid") from None
+                proposal, draft, context, comparison, signature, data = self._validate_finalizable_failure(
+                    run_id, task=task, supervisor_execution_id=supervisor_execution_id, config=config,
+                    artifact_root=artifact_root, max_diff_bytes=max_diff_bytes, max_patch_bytes=max_patch_bytes)
                 if proposal.category != FailureCategory.IMPLEMENTATION_FAILURE:
                     raise RecoveryDecisionUnavailableError("Only implementation failure recovery is available")
-                observations = build_failure_observations(self.session, run_id, verifier_id,
-                    draft_artifact_id=draft_id, independent_artifact_id=independent_id, artifact_root=artifact_root,
-                    max_diff_bytes=max_diff_bytes, max_patch_bytes=max_patch_bytes)
-                if observations != data.get("observations"):
-                    raise VerificationEvidenceError("Failure observations changed after classification")
-                resolve_verification_failure_evidence(proposal, observations)
-                draft = load_semantic_review_draft(self.session, run_id, verifier_id,
-                    artifact_id=draft_id, artifact_root=artifact_root)
-                context, comparison = build_verifier_semantic_context(self.session, run_id, verifier_id,
-                    selection=draft.selection, artifact_root=artifact_root,
-                    max_diff_bytes=max_diff_bytes, max_patch_bytes=max_patch_bytes)
-                call = self.session.get(ToolCall, draft.selection.current_call_id)
-                baseline_call = self.session.get(ToolCall, draft.selection.baseline_call_id)
-                hashed = (config.command if config.pythonpath_relative is None else
-                          {"command": config.command, "pythonpath": config.pythonpath_relative})
-                digest = sha256(json.dumps(hashed, ensure_ascii=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-                if (draft.selection.command_name != config.command_name or draft.selection.target_tests != config.target_tests
-                        or call is None or call.args.get("command_sha256") != digest or baseline_call is None
-                        or baseline_call.args.get("baseline_workspace_checked") is not True
-                        or preliminary_public_outcome(comparison, draft.review).value != "failed"):
-                    raise VerificationEvidenceError("Configured tests, baseline or failure do not match")
-                signature = None
-                if proposal.evidence_refs == ("semantic_review",):
-                    signature = semantic_failure_signature(draft.review)
-                elif proposal.evidence_refs == ("public_tests",):
-                    report = load_pytest_report_artifact(self.session, run_id, verifier_id,
-                        tool_call_id=draft.selection.current_call_id, artifact_id=draft.selection.current_artifact_id,
-                        artifact_root=artifact_root, expected_command_name=draft.selection.command_name)
-                    signature = public_failure_signature(report, comparison)
-                if signature is None:
-                    raise RecoveryDecisionUnavailableError("A specific failure signature is unavailable")
+                verifier_id = UUID(data["verifier_execution_id"])
+                draft_id = UUID(data["draft_artifact_id"])
+                independent_id = UUID(data["independent_artifact_id"]) if data.get("independent_artifact_id") else None
                 history = self._read_recovery_history(run, signature)
                 limit_reached = (history.retries_started >= policy.budget.max_retries_per_task
                     or history.previous_signature_occurrences + 1 >= policy.budget.max_same_signature_occurrences)
@@ -1405,6 +1772,88 @@ class RunCoordinator:
                 task.status = TaskStatus.RETRYING if action == "REVISE_IMPLEMENTATION" else TaskStatus.ESCALATED
                 return verification.id
 
+    def finalize_unknown_failure(
+        self, run_id: UUID, worker_id: str, *, supervisor_execution_id: UUID,
+        verification_config: VerificationConfig, workspace_root: Path, artifact_root: Path,
+        max_diff_bytes: int, max_patch_bytes: int, stop_event: Event,
+    ) -> dict[str, object]:
+        """Commit UNKNOWN_FAILURE and decide from durable rediagnosis starts, not proposals."""
+        config = VerificationConfig.model_validate(verification_config.model_dump())
+        if config.external_connections != "none" or stop_event is None or min(max_diff_bytes, max_patch_bytes) <= 0:
+            raise VerificationEvidenceError("Task configuration or evidence limits are incomplete")
+        with workspace_operation_lock(self.session.get_bind(), run_id, stop_event=stop_event,
+                                      check_unsettled_mutations=True) as workspace_receipt:
+            with self.session.begin():
+                policy = self.assert_execution_right(run_id, worker_id)
+                run = self.session.get(Run, run_id)
+                task = self.session.scalar(select(Task).where(Task.id == run.task_id).with_for_update())
+                if task is None or task.id != config.task_id or task.base_commit != config.base_commit or task.status != TaskStatus.RUNNING:
+                    raise VerificationEvidenceError("Task or base does not match verification configuration")
+                proposal, draft, context, comparison, signature, data = self._validate_finalizable_failure(
+                    run_id, task=task, supervisor_execution_id=supervisor_execution_id, config=config,
+                    artifact_root=artifact_root, max_diff_bytes=max_diff_bytes, max_patch_bytes=max_patch_bytes)
+                if proposal.category != FailureCategory.UNKNOWN_FAILURE:
+                    raise RecoveryDecisionUnavailableError("Only UNKNOWN_FAILURE rediagnosis is available")
+                verifier_id = UUID(data["verifier_execution_id"])
+                draft_id = UUID(data["draft_artifact_id"])
+                independent_id = UUID(data["independent_artifact_id"]) if data.get("independent_artifact_id") else None
+                history = self._read_recovery_history(run, signature)
+                _, rediagnoses_pending, _ = self._read_rediagnosis_usage(task.id)
+                # Pending tracked Runs have not started but reserve quota until
+                # they start or become terminal; never authorize past the budget.
+                rediagnoses_consumed = (None if history.rediagnoses_started is None
+                                        else history.rediagnoses_started + rediagnoses_pending)
+                assessment = assess_recovery_policy(policy.budget, RecoveryFacts(
+                    category=FailureCategory.UNKNOWN_FAILURE,
+                    retries_started=history.retries_started,
+                    signature_occurrences=history.previous_signature_occurrences + 1,
+                    rediagnoses_started=rediagnoses_consumed,
+                    has_compliant_plan=self._rediagnosis_plan_available(policy),
+                    has_new_information_or_strategy=True, transient_retry_safe=False))
+                policy_reasons = list(assessment.reasons)
+                if history.failed_runs_without_record:
+                    policy_reasons.append("incomplete_recovery_history")
+                action = ("REDIAGNOSE" if not policy_reasons and assessment.decision == "allow_recovery"
+                          else "ESCALATE_TO_HUMAN")
+                actual = inspect_workspace_diff(workspace_root, task.base_commit,
+                    timeout_seconds=policy.budget.tool_call_timeout_seconds, stop_event=stop_event, artifact_root=artifact_root)
+                if actual.diff.preview.stdout_truncated or sha256(actual.diff.stdout).hexdigest() != context["workspace_diff"]["content_hash"]:
+                    raise VerificationEvidenceError("Workspace differs from reviewed diff")
+                if stop_event.is_set():
+                    raise GitExecutionCancelledError("Failure finalization stopped")
+                self.assert_execution_right(run_id, worker_id)
+                workspace_receipt.assert_held(self.session)
+                verifier = self.session.get(AgentExecution, verifier_id)
+                pending = self.session.scalar(select(exists().where(ToolCall.run_id == run_id,
+                    ToolCall.agent_execution_id == verifier_id,
+                    ToolCall.status.in_((ToolCallStatus.REQUESTED, ToolCallStatus.RUNNING)))))
+                if pending:
+                    raise AgentExecutionPendingToolsError("Verifier has pending tool calls")
+                verification = Verification(run_id=run_id, result=VerificationResult.FAILED,
+                    evidence={"scope": "trusted_v1", "draft_artifact_id": str(draft_id),
+                        "supervisor_execution_id": str(supervisor_execution_id),
+                        "independent_artifact_id": str(independent_id) if independent_id else None,
+                        "selection": draft.selection.model_dump(mode="json"),
+                        "test_comparison": comparison.model_dump(mode="json"),
+                        "semantic_review": draft.review.model_dump(mode="json"),
+                        "diff_statistics": context["workspace_diff"]["statistics"],
+                        "rediagnoses_started": history.rediagnoses_started,
+                        "rediagnoses_pending": rediagnoses_pending,
+                        "policy_reasons": policy_reasons})
+                self.session.add_all([verification, FailureRecord(run_id=run_id, category=proposal.category,
+                    signature=signature, recovery_action=action)])
+                self.session.flush()
+                verification_id = verification.id
+                task_id = task.id
+                verifier.status = AgentExecutionStatus.SUCCEEDED
+                verifier.output = {"outcome": "VERIFICATION_FAILED", "verification_id": str(verification.id)}
+                run.status = RunStatus.FAILED
+                run.finished_at = get_database_time(self.session)
+                task.status = TaskStatus.RETRYING if action == "REDIAGNOSE" else TaskStatus.ESCALATED
+                return {"verification_id": verification_id, "task_id": task_id,
+                        "recovery_action": action, "rediagnoses_started": history.rediagnoses_started,
+                        "rediagnoses_pending": rediagnoses_pending}
+
     def finalize_passing_verification(
         self, run_id: UUID, worker_id: str, *, agent_execution_id: UUID, draft_artifact_id: UUID,
         independent_artifact_id: UUID, verification_config: VerificationConfig, workspace_root: Path,
@@ -1431,14 +1880,9 @@ class RunCoordinator:
                 if (receipt.draft_artifact_id != draft_artifact_id or not receipt.calibrated
                         or receipt.outcome != "passed" or receipt.suite_version != config.independent_suite_version):
                     raise VerificationEvidenceError("A matching calibrated independent pass is required")
-                call = self.session.get(ToolCall, draft.selection.current_call_id)
-                hashed = (config.command if config.pythonpath_relative is None else
-                          {"command": config.command, "pythonpath": config.pythonpath_relative})
-                digest = sha256(json.dumps(hashed, ensure_ascii=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-                baseline_call = self.session.get(ToolCall, draft.selection.baseline_call_id)
-                if (draft.selection.command_name != config.command_name or draft.selection.target_tests != config.target_tests
-                        or call is None or call.args.get("command_sha256") != digest
-                        or baseline_call is None or baseline_call.args.get("baseline_workspace_checked") is not True):
+                _, baseline_call = self._require_matching_command_evidence(
+                    config, task=task, draft=draft, artifact_root=artifact_root)
+                if baseline_call is None or baseline_call.args.get("baseline_workspace_checked") is not True:
                     raise VerificationEvidenceError("Configured tests or checked baseline do not match")
                 context, comparison = build_verifier_semantic_context(self.session, run_id, agent_execution_id,
                     selection=draft.selection, artifact_root=artifact_root,
@@ -1617,24 +2061,33 @@ class RunCoordinator:
                     verifications = (self.session.scalars(select(Verification).where(
                         Verification.run_id == previous.id, Verification.result == VerificationResult.FAILED)).all()
                         if previous is not None else [])
-                    try:
-                        if len(verifications) != 1:
-                            raise ValueError("Previous verification is unavailable")
-                        previous_call_id = UUID(verifications[0].evidence["selection"]["patch_call_id"])
-                        previous_call = self.session.get(ToolCall, previous_call_id)
-                        previous_coder = self.session.get(AgentExecution, previous_call.agent_execution_id)
-                        previous_artifact_id = UUID(previous_coder.output["patch_artifact_id"])
-                        previous_artifact = self.session.get(Artifact, previous_artifact_id)
-                        if (previous_call.run_id != previous.id or previous_call.tool_name != "apply_patch"
-                                or previous_call.status != ToolCallStatus.SUCCEEDED
-                                or previous_coder.run_id != previous.id or previous_coder.agent_role != AgentRole.CODER.value.lower()
-                                or previous_artifact is None or previous_artifact.agent_execution_id != previous_coder.id
-                                or previous_artifact.kind != "patch"):
-                            raise ValueError("Previous patch evidence is invalid")
-                    except (ValueError, KeyError, TypeError, AttributeError):
-                        return ToolCallResult(status=ToolCallStatus.DENIED, reason="PRIOR_FAILURE_EVIDENCE_UNAVAILABLE")
-                    if sha256(patch_bytes).hexdigest() == previous_artifact.content_hash:
-                        return ToolCallResult(status=ToolCallStatus.DENIED, reason="UNCHANGED_FAILED_PATCH")
+                    evidence = verifications[0].evidence if len(verifications) == 1 else None
+                    # A rediagnosis Run follows an UNKNOWN_FAILURE, which may
+                    # legitimately have no previously verified patch to compare.
+                    # Only that absent-selection case is skipped: implementation
+                    # revisions and any present rediagnosis selection stay strict.
+                    no_prior_patch = (run.recovery_action == "REDIAGNOSE"
+                                      and isinstance(evidence, dict)
+                                      and evidence.get("selection") is None)
+                    if not no_prior_patch:
+                        try:
+                            if not isinstance(evidence, dict):
+                                raise ValueError("Previous verification is unavailable")
+                            previous_call_id = UUID(evidence["selection"]["patch_call_id"])
+                            previous_call = self.session.get(ToolCall, previous_call_id)
+                            previous_coder = self.session.get(AgentExecution, previous_call.agent_execution_id)
+                            previous_artifact_id = UUID(previous_coder.output["patch_artifact_id"])
+                            previous_artifact = self.session.get(Artifact, previous_artifact_id)
+                            if (previous_call.run_id != previous.id or previous_call.tool_name != "apply_patch"
+                                    or previous_call.status != ToolCallStatus.SUCCEEDED
+                                    or previous_coder.run_id != previous.id or previous_coder.agent_role != AgentRole.CODER.value.lower()
+                                    or previous_artifact is None or previous_artifact.agent_execution_id != previous_coder.id
+                                    or previous_artifact.kind != "patch"):
+                                raise ValueError("Previous patch evidence is invalid")
+                        except (ValueError, KeyError, TypeError, AttributeError):
+                            return ToolCallResult(status=ToolCallStatus.DENIED, reason="PRIOR_FAILURE_EVIDENCE_UNAVAILABLE")
+                        if sha256(patch_bytes).hexdigest() == previous_artifact.content_hash:
+                            return ToolCallResult(status=ToolCallStatus.DENIED, reason="UNCHANGED_FAILED_PATCH")
             try:
                 paths = validate_patch_paths(
                     workspace_root, patch_bytes, approved_paths=approved_paths, stop_event=stop_event,
@@ -1724,9 +2177,31 @@ class RunCoordinator:
                 workspace_receipt.assert_held(session)
             self._record_tool_result(session, call_id, output, agent_execution_id=agent_execution_id)
 
+        def record_failure(error: Exception) -> None:
+            # Only the boundary that creates the process can prove nothing was started.
+            # Every other error leaves the outcome unknown and must not be filed as a
+            # clean failure, whatever its type happens to be.
+            unstarted = proves_process_not_started(error)
+            reason = (f"COMMAND_START_FAILED:{type(error).__name__}" if unstarted
+                      else f"COMMAND_RESULT_UNKNOWN:{type(error).__name__}")
+            with self.session.begin():
+                self.assert_execution_right(run_id, worker_id)
+                if workspace_receipt is not None:
+                    workspace_receipt.assert_held(self.session)
+                if unstarted:
+                    self._record_tool_result(
+                        self.session, call_id,
+                        ToolCallResult(status=ToolCallStatus.FAILED, reason=reason),
+                        agent_execution_id=agent_execution_id)
+                elif ToolCallRepository(self.session).mark_result_unknown(
+                        call_id, reason=reason) == 0:
+                    raise ToolCallStateConflictError(
+                        f"ToolCall {call_id} no longer accepts a result")
+
         return self._execute_recorded_tool_call(
             run_id, worker_id, call_id,
             execute=execute_with_permission, record_result=record_result,
+            record_failure=record_failure,
         )
 
     @staticmethod
@@ -1740,6 +2215,12 @@ class RunCoordinator:
         )
         if updated == 0:
             raise ToolCallStateConflictError(f"ToolCall {call_id} no longer accepts a result")
+        if output.observed is not None:
+            call = session.get(ToolCall, call_id)
+            if call is None or not isinstance(call.args, dict):
+                raise ToolCallStateConflictError(
+                    f"ToolCall {call_id} has no request arguments to annotate")
+            call.args = {**call.args, "observed": dict(output.observed)}
         session.add_all(
             Artifact(
                 id=artifact.id, agent_execution_id=agent_execution_id, tool_call_id=call_id,
@@ -1773,8 +2254,23 @@ class RunCoordinator:
         self, run_id: UUID, worker_id: str, call_id: UUID, *,
         execute: Callable[[UUID], ToolOutput],
         record_result: Callable[[Session, UUID, ToolOutput], None],
+        record_failure: Callable[[Exception], None] | None = None,
     ) -> UUID:
-        output = execute(call_id)
+        try:
+            output = execute(call_id)
+        except Exception as error:
+            # A call that failed before producing a result must not stay pending: a later
+            # finish_agent_execution would raise AgentExecutionPendingToolsError and hide
+            # this error behind it. Record a terminal state, then let the original raise.
+            if record_failure is not None:
+                try:
+                    record_failure(error)
+                except Exception as bookkeeping_error:
+                    # The lease may be gone or the row may already be settled; either way
+                    # the caller's error is what the operator needs to see.
+                    error.add_note("Failed tool call could not be recorded: "
+                                   f"{type(bookkeeping_error).__name__}")
+            raise
 
         with self.session.begin():
             self.assert_execution_right(run_id, worker_id)
@@ -1833,28 +2329,367 @@ class RunCoordinator:
         return evidence
 
     def close_expired_run(self, run_id: UUID, *, decision: FailureDecision) -> UUID:
-        """Reject unverified recovery decisions until the control flow is integrated."""
-        raise RecoveryDecisionUnavailableError("Supervisor and Policy verification are not yet available")
+        """Verify one decision for a Run whose lease has expired, then close it.
+
+        An expired Run has no trustworthy attribution: its in-flight ToolCalls are
+        recorded as UNKNOWN_RESULT, so only an UNKNOWN_FAILURE classification may
+        close it and only another diagnosis attempt or human escalation is
+        admissible. A concrete retry, patch or environment action would claim
+        evidence this Run cannot produce. The rediagnosis quota and plan
+        availability are re-checked from durable history here, so a supplied
+        decision cannot grant itself a further attempt. Repeating the call on an
+        already closed Run raises RunLeaseNotExpiredError without writing a second
+        FailureRecord.
+        """
+        if decision.category != FailureCategory.UNKNOWN_FAILURE:
+            raise RecoveryDecisionUnavailableError(
+                "An expired Run can only be closed as UNKNOWN_FAILURE")
+        if decision.recovery_action not in ("REDIAGNOSE", "ESCALATE_TO_HUMAN"):
+            raise RecoveryDecisionUnavailableError(
+                "An expired Run admits only rediagnosis or escalation")
+        if decision.recovery_action == "REDIAGNOSE":
+            self._assert_expired_rediagnosis_is_permitted(run_id, decision.signature)
+        return self._commit_expired_run_decision(run_id, decision=decision)
+
+    def close_expired_run_with_derived_decision(self, run_id: UUID) -> dict:
+        """Derive and commit the recovery decision for an expired Run in one transaction.
+
+        A lease expiry only proves the Worker stopped renewing, so the cause can be
+        neither confirmed nor excluded here: the Run is always classified
+        UNKNOWN_FAILURE and only durable budget and plan availability decide between
+        another diagnosis attempt and human escalation. Every lease expiry in one
+        Task shares ``LEASE_EXPIRED_SIGNATURE``, which states the event class rather
+        than a proven shared root cause, so repeated expiries reach the same-signature
+        limit instead of consuming unlimited quota. Unknown or inconsistent history
+        escalates instead of spending budget. Deriving and committing stay inside the
+        same Run and Task row locks, so a caller cannot supply a conclusion and obtain
+        quota from it. Repeating the call on a closed Run raises
+        RunLeaseNotExpiredError without writing a second FailureRecord.
+        """
+        with self.session.begin():
+            run, task, policy, now = self._lock_expired_run_and_policy(run_id)
+            assessment, block_reasons = self._assess_expired_rediagnosis(
+                run, task, policy, LEASE_EXPIRED_SIGNATURE)
+            allowed = assessment is not None and assessment.decision == "allow_recovery"
+            decision = FailureDecision(
+                category=FailureCategory.UNKNOWN_FAILURE, signature=LEASE_EXPIRED_SIGNATURE,
+                recovery_action="REDIAGNOSE" if allowed else "ESCALATE_TO_HUMAN")
+            failure_id = self._apply_expired_run_close(run, task, decision, now)
+            reasons = block_reasons if assessment is None else assessment.reasons
+        return {"outcome": "closed", "failure_id": failure_id,
+                "recovery_action": decision.recovery_action,
+                "category": decision.category.value, "signature": decision.signature,
+                "task_id": task.id, "policy_reasons": list(reasons)}
+
+    def find_next_expired_run_id(self) -> UUID | None:
+        """Return one expired RUNNING Run id without deciding what to do with it.
+
+        The row lock with ``skip_locked`` lets concurrent reclaimers pick different
+        Runs instead of queuing on the same one. The lock is released when this
+        transaction ends, so the caller's later close re-checks expiry and cannot
+        act on a Run that another reclaimer already handled.
+        """
+        with self.session.begin():
+            return self.session.scalar(select(Run.id).where(
+                Run.status == RunStatus.RUNNING,
+                Run.lease_expires_at <= func.clock_timestamp(),
+            ).order_by(Run.lease_expires_at, Run.id).limit(1).with_for_update(skip_locked=True))
+
+    def find_pending_expired_recovery_id(self) -> UUID | None:
+        """Observe one closed lease-expiry Run awaiting a recovery Run.
+
+        This is not a claim; the caller must revalidate and use the existing
+        idempotent recovery entry before acting on the returned identifier.
+        """
+        from sqlalchemy.orm import aliased
+        from sqlalchemy import cast, Text
+
+        with self.session.begin():
+            later_run = aliased(Run)
+            stmt = (
+                select(Run.id)
+                .join(Task, Run.task_id == Task.id)
+                .where(
+                    Task.status == TaskStatus.RETRYING,
+                    Run.status == RunStatus.FAILED,
+                    ~exists().where(
+                        later_run.task_id == Run.task_id,
+                        later_run.attempt_number > Run.attempt_number,
+                    ),
+                    select(func.count(FailureRecord.id))
+                    .where(FailureRecord.run_id == Run.id)
+                    .correlate(Run)
+                    .scalar_subquery()
+                    == 1,
+                    exists().where(
+                        FailureRecord.run_id == Run.id,
+                        FailureRecord.category == FailureCategory.UNKNOWN_FAILURE,
+                        FailureRecord.signature == LEASE_EXPIRED_SIGNATURE,
+                        FailureRecord.recovery_action == "REDIAGNOSE",
+                    ),
+                    select(func.count(Verification.id))
+                    .where(Verification.run_id == Run.id)
+                    .correlate(Run)
+                    .scalar_subquery()
+                    == 1,
+                    exists().where(
+                        Verification.run_id == Run.id,
+                        Verification.result == VerificationResult.FAILED,
+                        Verification.evidence["scope"].as_string() == "no_verification",
+                        Verification.evidence["reason"].as_string() == "worker_lease_expired",
+                        Verification.evidence["run_id"].as_string() == cast(Run.id, Text),
+                    ),
+                )
+                .order_by(Run.finished_at.asc(), Run.id.asc())
+                .limit(1)
+            )
+            return self.session.execute(stmt).scalars().first()
+
+    def inspect_expired_run(self, run_id: UUID) -> dict:
+        """Read a control-plane snapshot of one Run without changing or locking it.
+
+        Reports every reason a takeover would have to refuse on, so an operator can
+        choose between taking the Run over and closing it. Nothing is written and no
+        lock is taken; the workspace advisory lock is deliberately not probed here,
+        because acquiring it would be a side effect and the takeover re-checks it.
+        """
+        with self.session.begin():
+            run = self.session.get(Run, run_id)
+            if run is None:
+                raise RunExecutionDeniedError(f"Run {run_id} does not exist")
+            task = self.session.get(Task, run.task_id)
+            if task is None:
+                raise TaskNotFoundError(f"Task {run.task_id} not found")
+            policy = PolicyConfig.model_validate(task.policy_snapshot)
+            if policy.policy_version != task.policy_version:
+                raise ValueError("Task policy_version does not match its policy_snapshot")
+            observed_at = get_database_time(self.session)
+            deadline = run.started_at + timedelta(seconds=policy.budget.max_run_duration_seconds)
+            orphaned = [
+                {"agent_execution_id": str(execution_id), "agent_role": role}
+                for execution_id, role in self.session.execute(select(
+                    AgentExecution.id, AgentExecution.agent_role).where(
+                        AgentExecution.run_id == run_id,
+                        AgentExecution.status == AgentExecutionStatus.RUNNING)).all()
+            ]
+            mutating = [
+                {"tool_call_id": str(call_id), "tool_name": tool_name, "status": status.value}
+                for call_id, tool_name, status in self.session.execute(select(
+                    ToolCall.id, ToolCall.tool_name, ToolCall.status).where(
+                        ToolCall.run_id == run_id,
+                        ToolCall.tool_name.in_(_MUTATING_TOOL_NAMES),
+                        ToolCall.status.in_((ToolCallStatus.REQUESTED, ToolCallStatus.RUNNING,
+                                             ToolCallStatus.UNKNOWN_RESULT)),
+                    ).order_by(ToolCall.created_at, ToolCall.id)).all()
+            ]
+            lease_expired = run.status == RunStatus.RUNNING and observed_at >= run.lease_expires_at
+            duration_exhausted = observed_at >= deadline
+            blockers = []
+            if run.status != RunStatus.RUNNING:
+                blockers.append("run_not_running")
+            elif not lease_expired:
+                blockers.append("lease_not_expired")
+            if task.status != TaskStatus.RUNNING:
+                blockers.append("task_not_running")
+            if duration_exhausted:
+                blockers.append("duration_exhausted")
+            if mutating:
+                blockers.append("unsettled_mutation")
+            if orphaned:
+                blockers.append("orphaned_executions")
+            return {
+                "run_id": str(run.id), "task_id": str(run.task_id),
+                "worker_id": run.worker_id, "attempt_number": run.attempt_number,
+                "status": run.status.value,
+                "started_at": run.started_at.isoformat(),
+                "lease_expires_at": run.lease_expires_at.isoformat(),
+                "duration_deadline": deadline.isoformat(),
+                "observed_at": observed_at.isoformat(),
+                "lease_expired": lease_expired,
+                "duration_exhausted": duration_exhausted,
+                "orphaned_executions": orphaned,
+                "unsettled_mutation_tool_calls": mutating,
+                "takeover_blockers": blockers,
+            }
+
+    def take_over_expired_run(
+        self, run_id: UUID, worker_id: str, *, lease_seconds: int | None = None,
+        stop_event: Event | None = None, lock_timeout_seconds: float = 30,
+    ) -> dict:
+        """Transfer execution right of an expired RUNNING Run to another worker.
+
+        An expired lease only proves the previous worker stopped renewing; it does
+        not prove its process exited or that no operation is still running. Ownership
+        is therefore replaced only after the Run's workspace advisory lock is actually
+        held — which a live operation on that workspace would block — and after the
+        workspace is confirmed free of unsettled mutating ToolCalls, since a
+        half-applied patch or an in-flight command cannot be attributed. Either check
+        failing raises instead of guessing. Ownership replacement itself happens under
+        the Run row lock with database time, so two claimants cannot both win.
+
+        In-flight ToolCalls that are left are recorded as UNKNOWN_RESULT; they are
+        never replayed or given a fabricated exit code. Nodes still RUNNING are
+        reported, not rewritten. The new lease never extends past the Run's fixed
+        duration deadline, so a takeover cannot buy more wall-clock time than Policy
+        allows.
+        """
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise ValueError("worker_id must be a non-blank string")
+        if lease_seconds is not None and lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        if lock_timeout_seconds <= 0:
+            raise ValueError("lock_timeout_seconds must be positive")
+        with workspace_operation_lock(
+            self.session.get_bind(), run_id, stop_event=stop_event,
+            timeout_seconds=lock_timeout_seconds, check_unsettled_mutations=True,
+        ) as workspace_receipt:
+            with self.session.begin():
+                run = self.run_repository.get_by_id_for_update(run_id)
+                if run is None:
+                    raise RunExecutionDeniedError(f"Run {run_id} does not exist")
+                now = get_database_time(self.session)
+                if run.status != RunStatus.RUNNING or now < run.lease_expires_at:
+                    raise RunLeaseNotExpiredError(f"Run {run_id} is not RUNNING with an expired lease")
+                task = self.session.scalar(select(Task).where(Task.id == run.task_id))
+                if task is None:
+                    raise TaskNotFoundError(f"Task {run.task_id} not found")
+                if task.status != TaskStatus.RUNNING:
+                    raise TaskStateConflictError(
+                        f"Run {run_id} belongs to a Task that is no longer RUNNING")
+                policy = PolicyConfig.model_validate(task.policy_snapshot)
+                if policy.policy_version != task.policy_version:
+                    raise ValueError("Task policy_version does not match its policy_snapshot")
+                deadline = run.started_at + timedelta(seconds=policy.budget.max_run_duration_seconds)
+                requested = lease_seconds or self.lease_config.lease_duration_seconds
+                remaining = (deadline - now).total_seconds()
+                if remaining <= 0:
+                    raise RunExecutionDeniedError(
+                        f"Run {run_id} has passed its fixed duration deadline")
+                orphaned = [
+                    {"agent_execution_id": str(execution_id), "agent_role": role}
+                    for execution_id, role in self.session.execute(select(
+                        AgentExecution.id, AgentExecution.agent_role).where(
+                            AgentExecution.run_id == run_id,
+                            AgentExecution.status == AgentExecutionStatus.RUNNING)).all()
+                ]
+                unknown_calls = self._mark_pending_tool_calls_unknown(run_id)
+                previous_worker_id = run.worker_id
+                run.worker_id = worker_id
+                run.last_heartbeat_at = now
+                run.lease_expires_at = now + timedelta(seconds=min(requested, int(remaining)))
+                lease_expires_at = run.lease_expires_at
+                task_id = task.id
+                # The advisory lock must still be held when ownership commits, so a
+                # lost lock connection cannot silently vouch for an unguarded Run.
+                workspace_receipt.assert_held(self.session)
+        return {"outcome": "taken_over", "run_id": run_id, "task_id": task_id,
+                "worker_id": worker_id,
+                "previous_worker_id": previous_worker_id,
+                "lease_expires_at": lease_expires_at,
+                "unknown_tool_calls": unknown_calls, "orphaned_executions": orphaned}
+
+    def _lock_expired_run_and_policy(self, run_id: UUID) -> tuple[Run, Task, PolicyConfig, datetime]:
+        """Lock one expired Run and its Task; return the pinned Policy and database time.
+
+        The Task must still be RUNNING. An expired Run whose Task moved on — accepted,
+        rejected, escalated or closed by another path — no longer describes the Task's
+        current attempt, so rewriting that Task's status from it would overwrite newer
+        state with a stale one. Refusing is the only safe answer.
+        """
+        run = self.run_repository.get_by_id_for_update(run_id)
+        if run is None:
+            raise RunExecutionDeniedError(f"Run {run_id} does not exist")
+        now = get_database_time(self.session)
+        if run.status != RunStatus.RUNNING or now < run.lease_expires_at:
+            raise RunLeaseNotExpiredError(f"Run {run_id} is not RUNNING with an expired lease")
+        task = self.session.scalar(select(Task).where(Task.id == run.task_id).with_for_update())
+        if task is None:
+            raise TaskNotFoundError(f"Task {run.task_id} not found")
+        if task.status != TaskStatus.RUNNING:
+            raise TaskStateConflictError(
+                f"Run {run_id} belongs to a Task that is no longer RUNNING")
+        policy = PolicyConfig.model_validate(task.policy_snapshot)
+        if policy.policy_version != task.policy_version:
+            raise ValueError("Task policy_version does not match its policy_snapshot")
+        return run, task, policy, now
+
+    def _assess_expired_rediagnosis(
+        self, run: Run, task: Task, policy: PolicyConfig, signature: str,
+    ) -> tuple[RecoveryAssessment | None, tuple[str, ...]]:
+        """Return the policy assessment, or the reasons its history cannot be trusted."""
+        history = self._read_recovery_history(run, signature)
+        started, reserved, untracked = self._read_rediagnosis_usage(task.id)
+        block_reasons = []
+        if history.rediagnoses_started is None or untracked:
+            block_reasons.append("rediagnose_history_unknown")
+        if history.failed_runs_without_record:
+            block_reasons.append("unrecorded_failures")
+        if block_reasons:
+            return None, tuple(block_reasons)
+        signature_occurrences = self.session.scalar(select(func.count(func.distinct(Run.id))).select_from(
+            FailureRecord).join(Run, FailureRecord.run_id == Run.id).where(
+                Run.task_id == task.id, Run.status == RunStatus.FAILED,
+                FailureRecord.signature == signature))
+        assessment = assess_recovery_policy(policy.budget, RecoveryFacts(
+            category=FailureCategory.UNKNOWN_FAILURE,
+            retries_started=history.retries_started,
+            signature_occurrences=max(1, signature_occurrences or 0),
+            rediagnoses_started=started + reserved,
+            has_compliant_plan=self._rediagnosis_plan_available(policy),
+            has_new_information_or_strategy=True, transient_retry_safe=False))
+        return assessment, ()
+
+    def _assert_expired_rediagnosis_is_permitted(self, run_id: UUID, signature: str) -> None:
+        """Re-check the rediagnosis budget and history of an expired Run."""
+        with self.session.begin():
+            run, task, policy, _ = self._lock_expired_run_and_policy(run_id)
+            assessment, block_reasons = self._assess_expired_rediagnosis(
+                run, task, policy, signature)
+            if assessment is None:
+                raise RecoveryDecisionUnavailableError(
+                    "Rediagnosis history is unknown or incomplete: " + ", ".join(block_reasons))
+            if assessment.decision != "allow_recovery":
+                raise RecoveryDecisionUnavailableError(
+                    "Rediagnosis policy or history no longer permits recovery")
+
+    def _apply_expired_run_close(
+        self, run: Run, task: Task, decision: FailureDecision, now: datetime,
+    ) -> UUID:
+        """Record the unknown tool results, the failed Run and its FailureRecord.
+
+        The Task status follows the same rule every other failure commit uses: a
+        further attempt leaves it RETRYING so a recovery Run can start, anything
+        else escalates it out of automatic recovery.
+
+        A Verification row is written because the recovery entry requires a failed
+        Verification for the last Run, but no check ever ran here: ``evidence.scope``
+        is ``no_verification`` so this records missing acceptance evidence and never
+        a failed check. Read ``evidence.scope`` before treating it as a verdict.
+        """
+        self._mark_pending_tool_calls_unknown(run.id)
+        run.status = RunStatus.FAILED
+        run.finished_at = now
+        task.status = (TaskStatus.RETRYING if decision.recovery_action == "REDIAGNOSE"
+                       else TaskStatus.ESCALATED)
+        self.session.add(Verification(
+            run_id=run.id, result=VerificationResult.FAILED,
+            evidence={"scope": "no_verification", "reason": "worker_lease_expired",
+                      "run_id": str(run.id), "attempt_number": run.attempt_number,
+                      "worker_id": run.worker_id, "observed_at": now.isoformat()},
+        ))
+        failure = FailureRecord(
+            run_id=run.id, category=decision.category, signature=decision.signature,
+            recovery_action=decision.recovery_action,
+        )
+        self.session.add(failure)
+        self.session.flush()
+        return failure.id
 
     def _commit_expired_run_decision(self, run_id: UUID, *, decision: FailureDecision) -> UUID:
         """Commit an already verified decision with the expired Run's terminal state."""
         with self.session.begin():
-            run = self.run_repository.get_by_id_for_update(run_id)
-            if run is None:
-                raise RunExecutionDeniedError(f"Run {run_id} does not exist")
-            now = get_database_time(self.session)
-            if run.status != RunStatus.RUNNING or now < run.lease_expires_at:
-                raise RunLeaseNotExpiredError(f"Run {run_id} is not RUNNING with an expired lease")
-            self._mark_pending_tool_calls_unknown(run_id)
-            run.status = RunStatus.FAILED
-            run.finished_at = now
-            failure = FailureRecord(
-                run_id=run_id, category=decision.category, signature=decision.signature,
-                recovery_action=decision.recovery_action,
-            )
-            self.session.add(failure)
-            self.session.flush()
-            failure_id = failure.id
+            run, task, _, now = self._lock_expired_run_and_policy(run_id)
+            failure_id = self._apply_expired_run_close(run, task, decision, now)
         return failure_id
 
     def mark_next_expired_run_tool_calls_unknown(self) -> UUID | None:
@@ -1918,7 +2753,11 @@ class RunCoordinator:
             )
         return run
 
-    def _create_initial_run(self, task: Task, worker_id: str, creation_idempotency_key: str) -> Run:
+    def _create_initial_run(
+        self, task: Task, worker_id: str, creation_idempotency_key: str, *,
+        expected_base_commit: str | None = None,
+        expected_policy: PolicyConfig | None = None,
+    ) -> Run:
         if task.status != TaskStatus.ELIGIBLE:
             raise TaskStateConflictError(
                 f"Task {task.id} is {task.status.value}; initial Run requires ELIGIBLE"
@@ -1930,6 +2769,15 @@ class RunCoordinator:
         policy = PolicyConfig.model_validate(task.policy_snapshot)
         if policy.policy_version != task.policy_version:
             raise ValueError("Task policy_version does not match its policy_snapshot")
+        # Re-check the caller's assumptions under the row lock: a Task edited between
+        # preparation and this claim must not produce a Run that was validated against
+        # values the Task no longer has.
+        if expected_base_commit is not None and task.base_commit != expected_base_commit:
+            raise TaskStateConflictError(
+                f"Task {task.id} base commit changed since this Run was prepared")
+        if expected_policy is not None and policy.model_dump() != expected_policy.model_dump():
+            raise TaskStateConflictError(
+                f"Task {task.id} Policy snapshot changed since this Run was prepared")
         database_time = get_database_time(self.session)
         lease_seconds = min(
             self.lease_config.lease_duration_seconds, policy.budget.max_run_duration_seconds,

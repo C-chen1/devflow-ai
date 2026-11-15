@@ -77,3 +77,25 @@ start启动单次后台循环；每轮通过工厂创建独立Session，事务�
 stop有界等待线程实际退出；仍存活则抛HeartbeatShutdownError，调用方应终止本轮处理/调度，不能捕获后当清理成功继续领取下一Run。daemon线程只为进程退出兜底，不强制结束数据库操作，也不代表资源清理完成。单条SQL超时包含锁等待，不替代网络/连接池的所有超时；Engine既有建连超时保持不变。宿主仍负责在启动工具前、正式结果提交事务中检查数据库执行权，并由Harness停止已启动进程；这些接入尚未实现。
 
 组件的25项单测和6项隔离PG测试覆盖两个信号、正常/异常收尾、保留原错误且日志脱敏、后台多轮独立Session、主流程事务不被心跳提交、事务局部SQL超时恢复、数据库锁等待取消、join超时确有活线程以及释放锁后最终结束。不创建正式public Run，不将测试处理当专业Agent执行。
+
+## 2026-11-13：执行入口另开了，本命令仍然只领取
+
+`python -m devflow_ai.worker_run`（Compose 里可选的 `worker` 服务）执行**调用方指定**的一个 Task 的 Run：
+先校验任务包、Task 状态、固定 commit、Policy 与目录，再原子领取；复用 `orchestration.drive_run_stages`
+（与基准入口同一份接线）、`Worker.execute_run` 的心跳与租约、执行权检查与 `model_gateways_from_env`。
+一次调用一次尝试、没有重试开关，不接管或关闭历史 Run，停止或失败时保留数据库里的真实状态，
+也不写基准记录或正式 Verification。`--attempt-kind formal` 在无法记录可信基线报告的平台上直接拒绝。
+
+本文前面描述的 `worker --once` 行为没有改变：它领取后即退出，不执行 Agent。常驻调度入口见下一节，
+但它同样不会自动发现任意 Task。
+
+## 2026-11-14：常驻调度入口 `worker_scheduler`
+
+`python -m devflow_ai.worker_scheduler` 是 docs/WORKER_SCHEDULER_PLAN.md 的 V1：可信清单里逐项登记
+Task ID、任务包与 Policy 文件，循环只对这些登记项各做一次 `worker_run` 领取与驱动；无效项记原因后跳过，
+行锁竞争时按间隔等待，收到停止信号后不再领取。它不自动发现任务、不重试、不接管或重放孤儿节点。
+默认是有限批次；`--watch` 才常驻（按间隔重读清单、清单坏了暂停领取、修复后继续）。契约与容器内演练命令见 docs/DEPLOYMENT.md 第 3.1 节。`worker --once` 仍然是领取后即退出的调试入口。
+
+2026-11-17：一次性入口支持 `--record <路径>`（清单条目用 `record` 字段）写出待审核运行记录；记录用与基准入口同一套 `BenchmarkRunRecord` 与分类逻辑，`formal_pass` 必须引用已提交的 Verification，审核结论留空，路径已存在则拒绝，重放不写记录。若进程在提交后、写记录前退出，重放不会补写；可由可信操作者显式运行 `python -m devflow_ai.record_backfill` 只读地生成一份新记录（细节见 docs/DEPLOYMENT.md）。
+
+2026-11-16：一次性入口支持 `--material <路径>`，调度清单条目支持 `material` 字段；两者都只是**路径**，材料文件由控制端保管在仓库之外（不得放在任务包、工作区根、产物根，或本地 `Task.repo` 源码 checkout 内）。只有 `--attempt-kind formal` 才会把它交给正式事务；`rehearsal`/`unknown` 收到材料也只演练，结果记 `skipped / attempt_kind_not_formal`。给出材料且草稿满足既有条件时，会在同一次执行的心跳与执行权内交给 `finalize_benchmark_run` 完成正式验收；没有材料则停在草稿。

@@ -22,9 +22,9 @@ class WorkspaceLockMonitorError(WorkspaceLockUnavailableError):
 
 
 class WorkspaceLockReceipt:
-    def __init__(self, backend_pid: int, run_id: UUID):
+    def __init__(self, backend_pid: int, run_id: UUID, *, namespace: int = 0):
         self.backend_pid = backend_pid
-        self.key = int.from_bytes(run_id.bytes[:8], byteorder="big")
+        self.key = int.from_bytes(run_id.bytes[:8], byteorder="big") ^ namespace
 
     def assert_held(self, session) -> None:
         held = session.scalar(text(
@@ -38,12 +38,15 @@ class WorkspaceLockReceipt:
 @contextmanager
 def workspace_operation_lock(
     engine: Engine, run_id: UUID, *, stop_event: Event | None = None, timeout_seconds: float = 30,
-    check_unsettled_mutations: bool = False,
+    check_unsettled_mutations: bool = False, namespace: int = 0,
 ):
-    """Hold a session-level PostgreSQL advisory lock for one Run operation."""
+    """Hold a session-level PostgreSQL advisory lock for one Run operation.
+
+    ``namespace`` separates independent lock domains for the same Run.
+    """
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
-    lock_key = int.from_bytes(run_id.bytes[:8], byteorder="big", signed=True)
+    lock_key = int.from_bytes(run_id.bytes[:8], byteorder="big", signed=True) ^ namespace
     deadline = monotonic() + timeout_seconds
     with engine.connect() as connection:
         acquired = False
@@ -76,7 +79,8 @@ def workspace_operation_lock(
                 )))
                 if unsettled:
                     raise WorkspaceQuarantinedError("Workspace has an unsettled mutating ToolCall")
-            receipt = WorkspaceLockReceipt(connection.scalar(text("SELECT pg_backend_pid()")), run_id)
+            receipt = WorkspaceLockReceipt(connection.scalar(text("SELECT pg_backend_pid()")), run_id,
+                                           namespace=namespace)
             if stop_event is not None:
                 def monitor_connection():
                     try:

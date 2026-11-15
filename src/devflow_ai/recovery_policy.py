@@ -36,7 +36,8 @@ class RecoveryHistory(BaseModel):
     retries_started: int = Field(ge=0)
     previous_signature_occurrences: int = Field(ge=0)
     failed_runs_without_record: int = Field(ge=0)
-    rediagnoses_started: None = None
+    # Counted from durable actual-start events, not Run creation, proposals or FailureRecords.
+    rediagnoses_started: int | None = Field(default=None, ge=0)
 
 
 def public_failure_signature(report: TestSuiteReport, comparison: TestComparison) -> str | None:
@@ -77,8 +78,12 @@ def assess_recovery_policy(budget: PolicyBudget, facts: RecoveryFacts) -> Recove
     if facts.signature_occurrences >= budget.max_same_signature_occurrences:
         reasons.append("signature_limit")
     rediagnoses_unknown = facts.category == FailureCategory.UNKNOWN_FAILURE and facts.rediagnoses_started is None
-    if facts.category == FailureCategory.UNKNOWN_FAILURE and facts.rediagnoses_started is not None:
-        if facts.rediagnoses_started >= budget.max_rediagnose_attempts:
+    if facts.category == FailureCategory.UNKNOWN_FAILURE:
+        if facts.rediagnoses_started is None:
+            if budget.max_rediagnose_attempts == 0:
+                # A zero quota is exhausted without knowing how many attempts started.
+                reasons.append("rediagnose_limit")
+        elif facts.rediagnoses_started >= budget.max_rediagnose_attempts:
             reasons.append("rediagnose_limit")
     if not facts.has_compliant_plan:
         reasons.append("no_compliant_plan")

@@ -3,7 +3,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from devflow_ai.enums import AgentExecutionStatus, AgentRole, ToolCallStatus, RunStatus, VerificationResult
+from devflow_ai.enums import AgentExecutionStatus, AgentRole, FailureCategory, ToolCallStatus, RunStatus, VerificationResult
 from devflow_ai.artifacts import ArtifactVerificationError, read_verified_artifact
 from devflow_ai.coder import CoderOutput, PatchReady
 from devflow_ai.models import AgentExecution, Artifact, FailureRecord, Handoff, Run, Task, ToolCall, Verification
@@ -51,12 +51,150 @@ def resolve_read_evidence(
             raise AgentReadEvidenceError(
                 f"ToolCall {reference.tool_call_id} is not a matching successful read in this execution"
             )
-        evidence.append({
+        entry = {
             "path": reference.path,
             "tool_call_id": str(reference.tool_call_id),
+            # `truncated` keeps its meaning: this read is not the whole file. A ranged read
+            # that stops short of the end, or starts after the first line, is truncated too.
             "truncated": call.reason == "OUTPUT_TRUNCATED",
-        })
+        }
+        _add_read_window(entry, call.args)
+        evidence.append(entry)
     return evidence
+
+
+# A prior exploration is re-sent with every later Planner call, so its previews share one
+# character budget instead of being cut per file at an arbitrary size.
+#
+# Two different facts are reported separately, and neither implies the other:
+#   `truncated`       the tool cut the read (reason=OUTPUT_TRUNCATED)
+#   `preview_clipped` this prompt contains less than the read produced
+# `preview_chars` is how much the read produced. A complete tool read therefore does *not*
+# mean a model has seen the whole file — do not read `truncated: false` as "complete input".
+PRIOR_PREVIEW_TOTAL_CHARS = 32_000
+
+
+def _bound_preview_budget(entries: list[dict], budget: int) -> None:
+    """Clip previews to a shared budget, most recent first, and say how much was left out.
+
+    Only `preview_clipped`/`preview_chars` describe this clip. They never touch
+    `truncated`, which belongs to the tool that performed the read.
+    """
+    remaining = budget
+    for entry in entries:
+        body = entry.get("preview")
+        entry["preview_chars"] = 0 if body is None else len(body)
+        if body is None:
+            entry["preview_clipped"] = False
+            continue
+        keep = max(0, min(len(body), remaining))
+        entry["preview"] = body[:keep]
+        entry["preview_clipped"] = keep < len(body)
+        remaining -= keep
+
+
+def _without_previews(exploration: dict[str, object]) -> dict[str, object]:
+    """Same references and findings, without the raw bodies."""
+    def strip(entries):
+        stripped = []
+        for entry in entries:
+            body = entry.get("preview")
+            replaced = {key: value for key, value in entry.items() if key != "preview"}
+            replaced["preview_chars"] = 0 if body is None else len(body)
+            replaced["preview_omitted"] = body is not None
+            stripped.append(replaced)
+        return stripped
+
+    result = dict(exploration)
+    result["read_evidence"] = strip(exploration.get("read_evidence", []))
+    if "prior_explorations" in exploration:
+        result["prior_explorations"] = [
+            {**prior, "read_evidence": strip(prior.get("read_evidence", []))}
+            for prior in exploration["prior_explorations"]
+        ]
+    # What has already been read in this Run, merged per file. This is history, not
+    # availability: it does not mean the content reached a model in full, and it must never
+    # stop a re-read that is needed to fill clipped or truncated evidence.
+    entries = [entry for group in [exploration.get("read_evidence", [])] + [
+        prior.get("read_evidence", []) for prior in exploration.get("prior_explorations", [])]
+        for entry in group]
+    result["already_read"] = summarize_read_coverage(entries)
+    result["preview_bodies"] = "omitted; the Planner receives them"
+    return result
+
+
+_READ_OBSERVED_KEYS = ("start_line", "end_line", "total_lines", "has_more",
+                      "byte_truncated", "partial_line")
+
+
+def _add_read_window(entry: dict, args) -> None:
+    """Copy the requested and the observed read window into one evidence entry.
+
+    The request (``offset``/``limit``) says what was asked for; the observed values say what
+    was actually read. They are kept apart on purpose, and an unknown value stays ``None`` —
+    a read that never scanned the whole file does not get a made-up total.
+    """
+    if not isinstance(args, dict):
+        return
+    if isinstance(args.get("offset"), int):
+        entry["offset"] = args["offset"]
+    if isinstance(args.get("limit"), int):
+        entry["limit"] = args["limit"]
+    observed = args.get("observed")
+    if isinstance(observed, dict):
+        for key in _READ_OBSERVED_KEYS:
+            if key in observed:
+                entry[key] = observed[key]
+
+
+def _merge_ranges(ranges: list[list[int]]) -> list[list[int]]:
+    """Merge overlapping or adjacent line ranges so coverage is one statement per file."""
+    merged: list[list[int]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def summarize_read_coverage(entries) -> list[dict]:
+    """Turn individual read windows into one per-file coverage summary.
+
+    A list of every window leaves the model comparing intervals by eye; merged ranges say
+    directly what is already in hand, which is what stops a re-read of a window that is
+    already covered. Unknown totals stay ``None``.
+    """
+    grouped: dict[str, dict] = {}
+    for entry in entries:
+        path = entry.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+        group = grouped.setdefault(path, {
+            "path": path, "covered_ranges": [], "reads": 0, "tool_call_ids": [],
+            "truncated": False, "total_lines": None,
+        })
+        group["reads"] += 1
+        call_id = entry.get("tool_call_id")
+        if isinstance(call_id, str):
+            group["tool_call_ids"].append(call_id)
+        if entry.get("truncated") is True:
+            group["truncated"] = True
+        if isinstance(entry.get("total_lines"), int):
+            group["total_lines"] = entry["total_lines"]
+        start, end = entry.get("start_line"), entry.get("end_line")
+        if isinstance(start, int) and isinstance(end, int) and end >= start:
+            # A byte-limited preview may contain only a prefix of its last line.
+            # Do not present that line as fully covered to subsequent agents.
+            complete_end = end - 1 if entry.get("partial_line") is True else end
+            if complete_end >= start:
+                group["covered_ranges"].append([start, complete_end])
+    summaries = []
+    for path in sorted(grouped):
+        group = grouped[path]
+        group["covered_ranges"] = _merge_ranges(group["covered_ranges"])
+        summaries.append(group)
+    return summaries
 
 
 class ContextBuilder:
@@ -85,14 +223,24 @@ class ContextBuilder:
         failures = self.session.scalars(select(FailureRecord).where(FailureRecord.run_id == previous.id)).all()
         verifications = self.session.scalars(select(Verification).where(Verification.run_id == previous.id,
             Verification.result == VerificationResult.FAILED)).all()
-        if len(failures) != 1 or len(verifications) != 1 or failures[0].recovery_action != "REVISE_IMPLEMENTATION":
-            raise ValueError("Previous implementation recovery evidence is unavailable")
+        if len(failures) != 1 or len(verifications) != 1:
+            raise ValueError("Previous failure recovery evidence is unavailable")
         failure, verification = failures[0], verifications[0]
+        action = run.recovery_action or failure.recovery_action
+        if action == "REVISE_IMPLEMENTATION":
+            if failure.category != FailureCategory.IMPLEMENTATION_FAILURE:
+                raise ValueError("Previous implementation recovery evidence is unavailable")
+        elif action == "REDIAGNOSE":
+            if failure.category != FailureCategory.UNKNOWN_FAILURE:
+                raise ValueError("Previous rediagnosis recovery evidence is unavailable")
+        else:
+            raise ValueError("Previous recovery action is unavailable")
         evidence = verification.evidence or {}
         return {"previous_run_id": str(previous.id), "verification_id": str(verification.id),
             "failure_record_id": str(failure.id), "category": failure.category.value,
-            "recovery_action": failure.recovery_action, "test_comparison": evidence.get("test_comparison"),
-            "semantic_review": evidence.get("semantic_review")}
+            "recovery_action": action, "test_comparison": evidence.get("test_comparison"),
+            "semantic_review": evidence.get("semantic_review"),
+            "policy_reasons": list(evidence.get("policy_reasons") or [])}
 
     def build_coder_input(self, run_id: UUID, *, handoff_id: UUID) -> dict[str, object] | None:
         handoff = self.session.scalar(
@@ -211,7 +359,9 @@ class ContextBuilder:
                 raise AgentReadEvidenceError("Explorer read evidence is no longer available")
             preview = call.stdout_excerpt
             ends_with_newline = (preview.endswith("\n") if preview is not None and not reference["truncated"] else None)
-            evidence.append({**reference, "preview": preview, "ends_with_newline": ends_with_newline})
+            evidence.append({**reference, "preview": preview, "ends_with_newline": ends_with_newline,
+                             "preview_chars": 0 if preview is None else len(preview),
+                             "preview_clipped": False})
         selected = self.session.get(AgentExecution, explorer_execution_id)
         previous_ids = self.session.scalars(select(AgentExecution.id).where(
             AgentExecution.run_id == run_id, AgentExecution.agent_role == AgentRole.EXPLORER.value.lower(),
@@ -227,20 +377,66 @@ class ContextBuilder:
                     ToolCall.id == UUID(reference["tool_call_id"]), ToolCall.run_id == run_id,
                     ToolCall.agent_execution_id == previous_id, ToolCall.tool_name == "read_file",
                     ToolCall.status == ToolCallStatus.SUCCEEDED))
-                clipped = preview is not None and len(preview) > 6000
-                previews.append({**reference, "preview": preview[:6000] if preview is not None else None,
-                                 "truncated": reference["truncated"] or clipped})
+                # `truncated` stays the tool's own verdict about the read; the builder's clip is
+                # reported separately so a Planner cannot mistake it for one — and so a complete
+                # read is not misread as "the Planner has the whole file".
+                previews.append({**reference, "preview": preview,
+                                 "truncated": reference["truncated"]})
             previous.append({"explorer_execution_id": str(previous_id),
                              "explorer_output": earlier["explorer_output"], "read_evidence": previews})
         if previous:
+            # The list runs oldest-to-newest; fill the budget from the newest backwards so a
+            # later re-read is not starved by an older one.
+            _bound_preview_budget(
+                [entry for prior in reversed(previous) for entry in prior["read_evidence"]],
+                PRIOR_PREVIEW_TOTAL_CHARS)
             context["prior_explorations"] = previous
         return {**context, "read_evidence": evidence}
 
     def build_supervisor_exploration(
         self, run_id: UUID, *, explorer_execution_id: UUID,
     ) -> dict[str, object] | None:
-        """Use the same verified Explorer previews available to Planner."""
-        return self.build_planner_input(run_id, explorer_execution_id=explorer_execution_id)
+        """Build the routing view: the same references and findings, no preview bodies.
+
+        A Supervisor decides where to route, not how to implement; sending it the raw
+        previews only repeated the largest part of the prompt that the Planner needs once.
+        The references, the tool's truncation verdict and the char counts stay in place, so
+        nothing about the evidence is claimed that is not true.
+        """
+        exploration = self.build_planner_input(run_id, explorer_execution_id=explorer_execution_id)
+        return None if exploration is None else _without_previews(exploration)
+
+    def build_already_read(self, run_id: UUID, *, limit: int = 20) -> list[dict[str, object]]:
+        """List the read windows this Run has already covered, newest first.
+
+        The Explorer needs this most: a second exploration that asks for a window already in
+        hand spends budget to learn nothing. Only committed, successful reads are listed, and
+        only their window — never the file contents.
+        """
+        rows = self.session.execute(
+            select(ToolCall.id, ToolCall.args, ToolCall.reason).where(
+                ToolCall.run_id == run_id,
+                ToolCall.tool_name == "read_file",
+                ToolCall.status == ToolCallStatus.SUCCEEDED,
+            ).order_by(ToolCall.created_at.desc(), ToolCall.id.desc()).limit(limit)
+        ).all()
+        seen, windows = set(), []
+        for call_id, args, reason in rows:
+            if not isinstance(args, dict) or not isinstance(args.get("path"), str):
+                continue
+            offset = args.get("offset") if isinstance(args.get("offset"), int) else None
+            line_limit = args.get("limit") if isinstance(args.get("limit"), int) else None
+            key = (args["path"], offset, line_limit)
+            if key in seen:
+                continue
+            seen.add(key)
+            entry: dict[str, object] = {
+                "path": args["path"], "tool_call_id": str(call_id),
+                "truncated": reason == "OUTPUT_TRUNCATED",
+            }
+            _add_read_window(entry, args)
+            windows.append(entry)
+        return summarize_read_coverage(windows)
 
     def build_planner_exploration(
         self, run_id: UUID, *, explorer_execution_id: UUID,

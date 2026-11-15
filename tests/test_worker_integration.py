@@ -656,19 +656,87 @@ def test_worker_runs_explorer_from_checkout_to_committed_result(worker_audit_ses
                 "success": AgentExecutionStatus.SUCCEEDED, "failed": AgentExecutionStatus.FAILED,
             }[outcome]
             if outcome == "success":
-                assert execution.output["read_evidence"] == [
-                    {"path": "README.md", "tool_call_id": str(call.id), "truncated": True},
-                ]
+                observed_read = {
+                    "path": "README.md", "tool_call_id": str(call.id), "truncated": True,
+                    "start_line": 1, "end_line": 1, "total_lines": None, "has_more": True,
+                    "byte_truncated": True, "partial_line": True,
+                }
+                assert execution.output["read_evidence"] == [observed_read]
                 assert planner_exploration == {
                     "explorer_execution_id": str(execution.id),
                     "explorer_output": {"preview": "pinned", "summary": "Inspected the complete file"},
-                    "read_evidence": [{"path": "README.md", "tool_call_id": str(call.id), "truncated": True}],
+                    "read_evidence": [observed_read],
                 }
             else:
                 assert execution.output["tool_call_id"] == str(call.id)
                 assert "read_evidence" not in execution.output
         if outcome != "success":
             assert planner_exploration is None
+
+
+@pytest.mark.parametrize("role", [AgentRole.EXPLORER, AgentRole.CODER, AgentRole.VERIFIER])
+def test_a_ranged_read_records_the_window_it_actually_covered(
+    worker_audit_session_factory, tmp_path, role,
+):
+    """A line range is how a large file's later part is reached without resending its head."""
+    factory = worker_audit_session_factory
+    task_id = create_eligible_task(factory)
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        snapshot = task.policy_snapshot
+        task.policy_snapshot = {
+            **snapshot,
+            "permissions": {"allowed_tools_by_role": {
+                **snapshot["permissions"]["allowed_tools_by_role"], role.value: ["read_file"],
+            }},
+        }
+    worker = Worker(factory, "range-reader")
+    claim = worker.claim_once()
+    workspaces, artifacts = tmp_path / "workspaces", tmp_path / "artifacts"
+    workspaces.mkdir()
+    artifacts.mkdir()
+    directories = worker.prepare_run_directories(
+        claim.run_id, workspaces_root=workspaces, artifacts_root=artifacts)
+    body = "".join(f"line {number}\n" for number in range(1, 41))
+    (directories.workspace_root / "core.py").write_bytes(body.encode("utf-8"))
+    with factory() as session:
+        execution_id = RunCoordinator(session).start_agent_execution(
+            claim.run_id, worker.worker_id, role=role, agent_input={})
+    read_file = worker.build_agent_read_file(
+        claim.run_id, agent_execution_id=execution_id, directories=directories,
+        max_bytes=4096, stop_event=Event())
+
+    middle = read_file("core.py", 20, 5)
+    assert middle.preview == "line 20\nline 21\nline 22\nline 23\nline 24\n"
+    # It is not the whole file, so the read is marked truncated whichever way it stops.
+    assert middle.truncated is True
+    # The receipt separates what was asked for from what was actually read.
+    assert (middle.requested_offset, middle.requested_limit) == (20, 5)
+    assert (middle.start_line, middle.end_line, middle.total_lines) == (20, 24, 40)
+    assert (middle.has_more, middle.byte_truncated, middle.partial_line) == (True, False, False)
+
+    everything = read_file("core.py", 1, 40)
+    assert everything.truncated is False
+    assert everything.preview == body
+    assert (everything.start_line, everything.end_line, everything.total_lines) == (1, 40, 40)
+    assert (everything.has_more, everything.byte_truncated) == (False, False)
+
+    past_the_end = read_file("core.py", 100, 5)
+    assert (past_the_end.preview, past_the_end.truncated) == ("", True)
+
+    with factory() as observer:
+        calls = observer.scalars(select(ToolCall).where(
+            ToolCall.run_id == claim.run_id).order_by(ToolCall.created_at)).all()
+        assert [(call.args.get("offset"), call.args.get("limit")) for call in calls] == [
+            (20, 5), (1, 40), (100, 5)]
+        assert calls[0].args["observed"] == {
+            "start_line": 20, "end_line": 24, "total_lines": 40,
+            "has_more": True, "byte_truncated": False, "partial_line": False,
+        }
+        # The path boundary is unchanged by the range: outside the workspace is still denied.
+        escaped = read_file("../outside.py", 1, 5)
+        assert escaped.status == ToolCallStatus.DENIED
+        assert escaped.reason == "WORKSPACE_PATH_DENIED"
 
 
 @pytest.mark.parametrize("scenario", ["success", "forged_reference", "tool_budget", "model_timeout"])
@@ -756,7 +824,9 @@ def test_worker_executes_one_model_directed_explorer_read(worker_audit_session_f
             planner_input = ContextBuilder(observer).build_planner_input(run_id, explorer_execution_id=execution_id)
             assert planner_input["read_evidence"] == [
                 {"path": "README.md", "tool_call_id": str(call.id), "truncated": True, "preview": "pinned",
-                 "ends_with_newline": None},
+                 "ends_with_newline": None, "preview_chars": 6, "preview_clipped": False,
+                 "start_line": 1, "end_line": 1, "total_lines": None, "has_more": True,
+                 "byte_truncated": True, "partial_line": True},
             ]
         else:
             assert len(calls) == (1 if scenario == "forged_reference" else 0)
@@ -1421,6 +1491,7 @@ def test_initial_supervisor_model_decides_and_dispatches_explorer(worker_audit_s
     assert len(received) == 1 and received[0].id == handoff_id
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Trusted baseline needs the Windows Job pytest report")
 def test_initial_supervisor_graph_runs_real_explorer_with_model_stubs(worker_audit_session_factory, tmp_path, monkeypatch):
     factory = worker_audit_session_factory
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
@@ -1503,7 +1574,8 @@ def test_initial_supervisor_graph_runs_real_explorer_with_model_stubs(worker_aud
         supervisor_context = ContextBuilder(session).build_supervisor_exploration(
             run_id, explorer_execution_id=explorer.id,
         )
-        assert supervisor_context["read_evidence"][0]["preview"] == "Repository facts\n"
+        assert "preview" not in supervisor_context["read_evidence"][0]
+        assert supervisor_context["read_evidence"][0]["preview_chars"] == len("Repository facts\n")
         assert supervisor_context["read_evidence"][0]["truncated"] is False
         explorer_id = explorer.id
         assert session.get(Run, run_id).status == RunStatus.RUNNING
@@ -1511,7 +1583,8 @@ def test_initial_supervisor_graph_runs_real_explorer_with_model_stubs(worker_aud
 
     def route_to_planner(prompt, _limit):
         data = json.loads(prompt.split("\nInput data JSON:\n", 1)[1])
-        assert data["read_evidence"][0]["preview"] == "Repository facts\n"
+        assert "preview" not in data["read_evidence"][0]
+        assert data["read_evidence"][0]["preview_chars"] == len("Repository facts\n")
         return ModelReply({"outcome": "PLAN", "reason": "Relevant evidence is available",
                            "next_goal": "Plan a bounded change"}, ModelTokenUsage(input_tokens=40, output_tokens=20))
     planner_gateway = PlannerModelGateway(session_factory=factory, worker_id=worker.worker_id,
@@ -1554,6 +1627,13 @@ def test_initial_supervisor_graph_runs_real_explorer_with_model_stubs(worker_aud
     with factory() as session:
         verifier = session.scalars(select(AgentExecution).where(AgentExecution.handoff_id == baseline_handoff)).one()
         assert verifier.output["outcome"] == "BASELINE_RECORDED"
+        prior_supervisor = session.scalars(select(AgentExecution).where(
+            AgentExecution.run_id == run_id,
+            AgentExecution.agent_role == "supervisor",
+            AgentExecution.output["approved_handoff_id"].as_string() == str(baseline_handoff),
+        )).one()
+        assert prior_supervisor.input["baseline_available"] is False
+        assert prior_supervisor.input["observed_baseline_verifier_id"] is None
         baseline_receipt = load_verifier_command_evidence(
             session, run_id, verifier.id, (UUID(verifier.output["tool_call_id"]),))[0]
         baseline = {"execution_id": verifier.id, "receipt": baseline_receipt}
@@ -1562,6 +1642,9 @@ def test_initial_supervisor_graph_runs_real_explorer_with_model_stubs(worker_aud
                                                      model_gateway=model, stop_event=stop)
     assert result.outcome == "CODE" and result.handoff_id is not None
     with factory() as session:
+        routed_supervisor = session.get(AgentExecution, result.execution_id)
+        assert routed_supervisor.input["baseline_available"] is True
+        assert routed_supervisor.input["observed_baseline_verifier_id"] == str(baseline["execution_id"])
         handoff = session.get(Handoff, result.handoff_id)
         coder_input = ContextBuilder(session).build_coder_input(run_id, handoff_id=result.handoff_id)
         assert handoff.from_agent_execution_id == planner_id
@@ -1774,8 +1857,12 @@ def test_planner_context_keeps_bounded_prior_exploration(worker_audit_session_fa
         context = ContextBuilder(session).build_planner_input(run_id, explorer_execution_id=explorers[1])
         prior = context["prior_explorations"][0]
         assert prior["explorer_execution_id"] == str(explorers[0])
-        assert len(prior["read_evidence"][0]["preview"]) == 6000
-        assert prior["read_evidence"][0]["truncated"] is True
+        # The read itself was complete, so it is not reported as truncated; only the
+        # builder's own budget clip would say otherwise, in its own field.
+        assert prior["read_evidence"][0]["truncated"] is False
+        assert prior["read_evidence"][0]["preview"] == "a" * 7000
+        assert prior["read_evidence"][0]["preview_chars"] == 7000
+        assert prior["read_evidence"][0]["preview_clipped"] is False
         assert context["read_evidence"][0]["preview"] == "new evidence"
 
 
@@ -1816,10 +1903,11 @@ def test_supervisor_after_explorer_respects_evidence_and_policy(worker_audit_ses
             agent_execution_id=explorer_id, status=AgentExecutionStatus.SUCCEEDED,
             output={"summary": "A partial read"}, llm_usage=None,
             read_evidence=(ReadEvidenceRef(path="src.py", tool_call_id=call_id),))
-    prompts = []
+    prompts, captured = [], []
     def generate(prompt, maximum):
         prompts.append(prompt)
         parsed = json.loads(prompt.split("\nInput data JSON:\n", 1)[1].split("\nThe previous", 1)[0])
+        captured.append(parsed)
         assert parsed["read_evidence"][0]["truncated"] is True
         if mode == "blocked":
             output = {"outcome": "BLOCKED", "reason": "conflicting facts", "decision_required": "clarify"}
@@ -1841,6 +1929,8 @@ def test_supervisor_after_explorer_respects_evidence_and_policy(worker_audit_ses
             explorer_execution_id=explorer_id, model_gateway=model, stop_event=Event())
         if mode == "reexplore":
             assert result.outcome == "RE_EXPLORE" and result.handoff_id is not None
+            # Routing can see how much model budget is left before asking for another round.
+            assert isinstance(captured[0]["remaining_model_tokens"], int)
             with factory() as session:
                 handoff = session.get(Handoff, result.handoff_id)
                 assert handoff.from_agent_execution_id == explorer_id and handoff.to_agent_role == "explorer"
@@ -3131,6 +3221,8 @@ def test_close_expired_run_commits_failure_and_unknown_tools_together(worker_aud
         connection.execute(text(f'SET LOCAL search_path TO "{schema}", public'))
         with Operations.context(MigrationContext.configure(connection)):
             scripts.get_revision("a43cb50f67e9").module.upgrade()
+            # Closing an expired Run also records the missing acceptance evidence.
+            scripts.get_revision("f154b6e82639").module.upgrade()
     worker = Worker(factory, "recovery-worker")
     create_eligible_task(factory)
     run_id = worker.claim_once().run_id
@@ -3149,8 +3241,12 @@ def test_close_expired_run_commits_failure_and_unknown_tools_together(worker_aud
     with factory.begin() as session:
         session.get(Run, run_id).lease_expires_at = func.clock_timestamp()
     with factory() as session:
-        with pytest.raises(RecoveryDecisionUnavailableError, match="Supervisor and Policy"):
-            RunCoordinator(session).close_expired_run(run_id, decision=decision)
+        # An expired Run admits only UNKNOWN_FAILURE with rediagnosis or escalation;
+        # a concrete action is rejected before anything is written.
+        with pytest.raises(RecoveryDecisionUnavailableError, match="rediagnosis or escalation"):
+            RunCoordinator(session).close_expired_run(run_id, decision=FailureDecision(
+                category=FailureCategory.UNKNOWN_FAILURE, signature="lease-expired:test",
+                recovery_action="RETRY_SAME_STEP"))
     with factory() as observer:
         assert observer.get(Run, run_id).status == RunStatus.RUNNING
         assert observer.get(ToolCall, call_id).status == ToolCallStatus.REQUESTED
@@ -3268,6 +3364,7 @@ def test_coder_patch_artifact_and_result_commit_atomically(worker_audit_session_
         assert observer.get(AgentExecution, coder_id).status == AgentExecutionStatus.SUCCEEDED
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Trusted baseline needs the Windows Job pytest report")
 @pytest.mark.parametrize("outcome", ["patch", "blocked", "out_of_scope", "apply_fails", "read_then_patch", "read_denied", "baseline_tampered_after_start", "format_then_patch", "format_exhausted", "format_no_budget", "recount_patch", "json_then_patch", "json_exhausted", "json_no_budget"])
 def test_coder_executes_approved_plan_with_guarded_patch(worker_audit_session_factory, tmp_path, outcome):
     factory = worker_audit_session_factory
@@ -3463,6 +3560,7 @@ def test_coder_executes_approved_plan_with_guarded_patch(worker_audit_session_fa
     assert (workspace / "config.py").read_text() == "old\n"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Trusted baseline needs the Windows Job pytest report")
 @pytest.mark.parametrize("tamper_report", [False, True])
 def test_baseline_verifier_records_failing_test_before_patch(worker_audit_session_factory, tmp_path, monkeypatch, tamper_report):
     factory = worker_audit_session_factory
@@ -4397,7 +4495,7 @@ def test_semantic_review_uses_committed_test_patch_and_diff_evidence(worker_audi
             assert observed["category"] == "IMPLEMENTATION_FAILURE"
             assert observed["signature"].startswith("semantic-v1:")
             assert observed["history"]["previous_signature_occurrences"] == 0
-            assert observed["history"]["rediagnoses_started"] is None
+            assert observed["history"]["rediagnoses_started"] == 0
         failed_draft_original = failed_draft_path.read_bytes()
         def tamper_during_model(*_):
             failed_draft_path.write_bytes(b"tampered")
@@ -4868,3 +4966,338 @@ def test_real_worker_process_reports_failure_without_sensitive_policy_input(run_
     with run_session_factory() as session:
         assert session.get(Task, task_id).status == TaskStatus.ELIGIBLE
         assert not session.scalars(select(Run)).all()
+
+
+def test_prior_exploration_previews_share_one_budget_and_say_what_was_cut(
+    worker_audit_session_factory,
+):
+    """A budgeted clip is reported as a clip, never as "the tool truncated the read"."""
+    from devflow_ai.context import PRIOR_PREVIEW_TOTAL_CHARS
+
+    factory = worker_audit_session_factory
+    worker = Worker(factory, "exploration-budget")
+    create_eligible_task(factory)
+    run_id = worker.claim_once().run_id
+    explorers = []
+    first_preview = "b" * (PRIOR_PREVIEW_TOTAL_CHARS + 5000)
+    for path, preview in (("huge.py", first_preview), ("small.py", "small evidence")):
+        with factory() as session:
+            explorer_id = RunCoordinator(session).start_agent_execution(run_id, worker.worker_id,
+                role=AgentRole.EXPLORER, agent_input={})
+        with factory.begin() as session:
+            repository = ToolCallRepository(session)
+            call_id = repository.add_requested(explorer_id, "read_file", {"path": path}, run_id=run_id)
+            repository.save_result(call_id, status=ToolCallStatus.SUCCEEDED, stdout_excerpt=preview)
+        with factory() as session:
+            RunCoordinator(session).finish_agent_execution(run_id, worker.worker_id, agent_execution_id=explorer_id,
+                status=AgentExecutionStatus.SUCCEEDED, output={"summary": "Read file"}, llm_usage=None,
+                read_evidence=(ReadEvidenceRef(path=path, tool_call_id=call_id),))
+        explorers.append(explorer_id)
+
+    with factory() as session:
+        context = ContextBuilder(session).build_planner_input(run_id, explorer_execution_id=explorers[1])
+    prior = context["prior_explorations"][0]["read_evidence"][0]
+    assert prior["preview_chars"] == len(first_preview)
+    assert len(prior["preview"]) == PRIOR_PREVIEW_TOTAL_CHARS
+    assert prior["preview_clipped"] is True
+    # The tool read the whole file; only this prompt was clipped, and it says so.
+    assert prior["truncated"] is False
+
+
+def test_supervisor_exploration_carries_references_without_preview_bodies(
+    worker_audit_session_factory,
+):
+    """Routing needs the finding and the references, not a second copy of the bytes."""
+    factory = worker_audit_session_factory
+    worker = Worker(factory, "supervisor-view")
+    create_eligible_task(factory)
+    run_id = worker.claim_once().run_id
+    with factory() as session:
+        explorer_id = RunCoordinator(session).start_agent_execution(run_id, worker.worker_id,
+            role=AgentRole.EXPLORER, agent_input={})
+    with factory.begin() as session:
+        repository = ToolCallRepository(session)
+        call_id = repository.add_requested(explorer_id, "read_file", {"path": "src.py"}, run_id=run_id)
+        repository.save_result(call_id, status=ToolCallStatus.SUCCEEDED, stdout_excerpt="def f():\n    return 1\n")
+    with factory() as session:
+        RunCoordinator(session).finish_agent_execution(run_id, worker.worker_id, agent_execution_id=explorer_id,
+            status=AgentExecutionStatus.SUCCEEDED, output={"summary": "Read src.py"}, llm_usage=None,
+            read_evidence=(ReadEvidenceRef(path="src.py", tool_call_id=call_id),))
+
+    with factory() as session:
+        builder = ContextBuilder(session)
+        routing = builder.build_supervisor_exploration(run_id, explorer_execution_id=explorer_id)
+        planner = builder.build_planner_input(run_id, explorer_execution_id=explorer_id)
+
+    entry = routing["read_evidence"][0]
+    assert "preview" not in entry
+    assert entry["preview_omitted"] is True
+    assert entry["preview_chars"] == len("def f():\n    return 1\n")
+    assert entry["truncated"] is False
+    assert routing["preview_bodies"] == "omitted; the Planner receives them"
+    # Routing can see what was already read, so it need not spend a call re-reading it.
+    already = routing["already_read"]
+    assert len(already) == 1 and already[0]["path"] == "src.py"
+    assert already[0]["tool_call_ids"] == [str(call_id)]
+    assert already[0]["truncated"] is False and already[0]["reads"] == 1
+    # This row was seeded without an observation, so no coverage is claimed for it.
+    assert already[0]["covered_ranges"] == []
+    # The Planner still gets the body: the split is explicit, not a loss of evidence.
+    assert planner["read_evidence"][0]["preview"] == "def f():\n    return 1\n"
+
+    # Prompt and payload agree: the Supervisor is told it has no bodies, and it has none.
+    from devflow_ai.supervisor import build_post_explorer_supervisor_prompt
+
+    assert "not file contents" in build_post_explorer_supervisor_prompt(routing)
+    assert '"preview":' not in json.dumps(routing)
+
+
+def test_a_ranged_read_is_visible_to_the_planner_and_to_routing(worker_audit_session_factory):
+    factory = worker_audit_session_factory
+    worker = Worker(factory, "range-evidence")
+    create_eligible_task(factory)
+    run_id = worker.claim_once().run_id
+    with factory() as session:
+        explorer_id = RunCoordinator(session).start_agent_execution(
+            run_id, worker.worker_id, role=AgentRole.EXPLORER, agent_input={})
+    with factory.begin() as session:
+        repository = ToolCallRepository(session)
+        call_id = repository.add_requested(
+            explorer_id, "read_file", {"path": "core.py", "offset": 20, "limit": 5}, run_id=run_id)
+        repository.save_result(call_id, status=ToolCallStatus.SUCCEEDED,
+                               stdout_excerpt="line 20\nline 21\n", reason="OUTPUT_TRUNCATED")
+    with factory() as session:
+        RunCoordinator(session).finish_agent_execution(
+            run_id, worker.worker_id, agent_execution_id=explorer_id,
+            status=AgentExecutionStatus.SUCCEEDED, output={"summary": "Option is at line 20"},
+            llm_usage=None, read_evidence=(ReadEvidenceRef(path="core.py", tool_call_id=call_id),))
+
+    with factory() as session:
+        builder = ContextBuilder(session)
+        planner = builder.build_planner_input(run_id, explorer_execution_id=explorer_id)
+        routing = builder.build_supervisor_exploration(run_id, explorer_execution_id=explorer_id)
+
+    entry = planner["read_evidence"][0]
+    assert (entry["offset"], entry["limit"]) == (20, 5)
+    # Ranged and partial: the Planner can see it has lines 20-21, not the whole file.
+    assert entry["truncated"] is True
+    # A row with no recorded observation says nothing about the total instead of inventing one.
+    assert "total_lines" not in entry
+    # Routing sees the same read; with no recorded observation it cannot claim coverage, and
+    # it does not substitute the requested window for the actual one.
+    already_read = routing["already_read"][0]
+    assert already_read["covered_ranges"] == []
+    assert already_read["reads"] == 1 and already_read["truncated"] is True
+
+
+def test_a_range_cut_by_the_byte_limit_still_saves_the_whole_file(worker_audit_session_factory, tmp_path):
+    """A cut preview keeps the same guarantee as a head read: the bytes are preserved."""
+    factory = worker_audit_session_factory
+    task_id = create_eligible_task(factory)
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        snapshot = task.policy_snapshot
+        task.policy_snapshot = {
+            **snapshot,
+            "permissions": {"allowed_tools_by_role": {
+                **snapshot["permissions"]["allowed_tools_by_role"], "EXPLORER": ["read_file"],
+            }},
+        }
+    worker = Worker(factory, "range-cap")
+    claim = worker.claim_once()
+    workspaces, artifacts = tmp_path / "workspaces", tmp_path / "artifacts"
+    workspaces.mkdir()
+    artifacts.mkdir()
+    directories = worker.prepare_run_directories(
+        claim.run_id, workspaces_root=workspaces, artifacts_root=artifacts)
+    body = "".join(f"line {number}\n" for number in range(1, 21))
+    (directories.workspace_root / "core.py").write_bytes(body.encode("utf-8"))
+    with factory() as session:
+        execution_id = RunCoordinator(session).start_agent_execution(
+            claim.run_id, worker.worker_id, role=AgentRole.EXPLORER, agent_input={})
+    read_file = worker.build_agent_read_file(
+        claim.run_id, agent_execution_id=execution_id, directories=directories,
+        max_bytes=12, stop_event=Event())
+
+    receipt = read_file("core.py", 1, 20)
+
+    # The preview keeps the whole first line and a bounded prefix of the second; the point is
+    # that it is not empty, and that the cut is stated rather than silently dropped.
+    assert receipt.truncated is True and receipt.preview == "line 1\nline "
+    assert (receipt.end_line, receipt.byte_truncated, receipt.partial_line) == (2, True, True)
+    assert len(receipt.artifact_ids) == 1
+    with factory() as observer:
+        artifact = observer.get(Artifact, receipt.artifact_ids[0])
+        assert Path(artifact.content_ref).read_bytes() == body.encode("utf-8")
+
+
+def test_already_read_merges_overlapping_windows_into_coverage(worker_audit_session_factory):
+    """The #3084 shape: three overlapping reads of one file must read as one coverage claim."""
+    factory = worker_audit_session_factory
+    worker = Worker(factory, "already-read")
+    create_eligible_task(factory)
+    run_id = worker.claim_once().run_id
+    with factory() as session:
+        explorer_id = RunCoordinator(session).start_agent_execution(
+            run_id, worker.worker_id, role=AgentRole.EXPLORER, agent_input={})
+
+    def record(offset, limit, start_line, end_line, *, total=3415):
+        with factory.begin() as session:
+            repository = ToolCallRepository(session)
+            call = repository.add_requested(
+                explorer_id, "read_file",
+                {"path": "core.py", "offset": offset, "limit": limit,
+                 "observed": {"start_line": start_line, "end_line": end_line,
+                              "total_lines": total, "has_more": end_line < total,
+                              "byte_truncated": False, "partial_line": False}},
+                run_id=run_id)
+            repository.save_result(call, status=ToolCallStatus.SUCCEEDED,
+                                   stdout_excerpt="line\n", reason="OUTPUT_TRUNCATED")
+            return call
+
+    record(1656, 900, 1656, 2555)
+    record(2555, 860, 2555, 3415)
+    # A later, narrower re-read of a range that is already covered.
+    record(2555, 450, 2555, 3004)
+    with factory.begin() as session:
+        repository = ToolCallRepository(session)
+        failed = repository.add_requested(
+            explorer_id, "read_file", {"path": "other.py", "offset": 1, "limit": 5}, run_id=run_id)
+        repository.save_result(failed, status=ToolCallStatus.FAILED, reason="FILE_NOT_FOUND")
+
+    with factory() as session:
+        coverage = ContextBuilder(session).build_already_read(run_id)
+
+    assert [entry["path"] for entry in coverage] == ["core.py"]
+    # 1656-2555 and 2555-3415 are adjacent, and 2555-3004 adds nothing new: one range.
+    assert coverage[0]["covered_ranges"] == [[1656, 3415]]
+    assert coverage[0]["reads"] == 3 and coverage[0]["total_lines"] == 3415
+    assert coverage[0]["truncated"] is True
+    assert len(coverage[0]["tool_call_ids"]) == 3
+
+
+def test_coverage_keeps_separate_files_apart(worker_audit_session_factory):
+    factory = worker_audit_session_factory
+    worker = Worker(factory, "coverage-files")
+    create_eligible_task(factory)
+    run_id = worker.claim_once().run_id
+    with factory() as session:
+        explorer_id = RunCoordinator(session).start_agent_execution(
+            run_id, worker.worker_id, role=AgentRole.EXPLORER, agent_input={})
+    for path, start_line, end_line in (("a.py", 1, 10), ("b.py", 5, 9)):
+        with factory.begin() as session:
+            repository = ToolCallRepository(session)
+            call = repository.add_requested(
+                explorer_id, "read_file",
+                {"path": path, "offset": start_line, "limit": end_line - start_line + 1,
+                 "observed": {"start_line": start_line, "end_line": end_line,
+                              "total_lines": None, "has_more": True,
+                              "byte_truncated": False, "partial_line": False}},
+                run_id=run_id)
+            repository.save_result(call, status=ToolCallStatus.SUCCEEDED,
+                                   stdout_excerpt="x\n", reason="OUTPUT_TRUNCATED")
+
+    with factory() as session:
+        coverage = ContextBuilder(session).build_already_read(run_id)
+
+    assert [(entry["path"], entry["covered_ranges"]) for entry in coverage] == [
+        ("a.py", [[1, 10]]), ("b.py", [[5, 9]])]
+    # An unknown total stays unknown instead of being inferred from the window.
+    assert all(entry["total_lines"] is None for entry in coverage)
+
+
+def test_coverage_does_not_mark_a_partially_read_line_complete():
+    from devflow_ai.context import summarize_read_coverage
+
+    entries = [
+        {"path": "x.py", "start_line": 1, "end_line": 3, "partial_line": True},
+        {"path": "y.py", "start_line": 4, "end_line": 4, "partial_line": True},
+    ]
+    coverage = summarize_read_coverage(entries)
+    assert coverage[0]["covered_ranges"] == [[1, 2]]
+    assert coverage[1]["covered_ranges"] == []
+
+
+def test_a_head_read_reports_the_total_only_when_it_actually_reached_the_end(
+    worker_audit_session_factory, tmp_path,
+):
+    """A head read does not scan the file, so an unknown total must stay unknown."""
+    factory = worker_audit_session_factory
+    task_id = create_eligible_task(factory)
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        snapshot = task.policy_snapshot
+        task.policy_snapshot = {
+            **snapshot,
+            "permissions": {"allowed_tools_by_role": {
+                **snapshot["permissions"]["allowed_tools_by_role"], "EXPLORER": ["read_file"],
+            }},
+        }
+    worker = Worker(factory, "head-window")
+    claim = worker.claim_once()
+    workspaces, artifacts = tmp_path / "workspaces", tmp_path / "artifacts"
+    workspaces.mkdir()
+    artifacts.mkdir()
+    directories = worker.prepare_run_directories(
+        claim.run_id, workspaces_root=workspaces, artifacts_root=artifacts)
+    (directories.workspace_root / "small.py").write_bytes(b"one\ntwo\n")
+    big = b"".join(b"line\n" for _ in range(1000))
+    (directories.workspace_root / "big.py").write_bytes(big)
+    with factory() as session:
+        execution_id = RunCoordinator(session).start_agent_execution(
+            claim.run_id, worker.worker_id, role=AgentRole.EXPLORER, agent_input={})
+    read_file = worker.build_agent_read_file(
+        claim.run_id, agent_execution_id=execution_id, directories=directories,
+        max_bytes=64, stop_event=Event())
+
+    whole = read_file("small.py")
+    assert (whole.start_line, whole.end_line, whole.total_lines) == (1, 2, 2)
+    assert (whole.has_more, whole.byte_truncated) == (False, False)
+
+    cut = read_file("big.py")
+    assert cut.truncated is True
+    assert cut.total_lines is None and cut.has_more is True and cut.byte_truncated is True
+    # What the preview did contain is still reported exactly: 12 whole lines plus a partial
+    # thirteenth, so the last line it touched is 13.
+    assert cut.start_line == 1
+    assert cut.end_line == cut.preview.count("\n") + 1
+
+
+def test_the_model_budget_splits_settled_and_reserved_requests(worker_audit_session_factory):
+    """A route needs to know what is left; an unusable legacy usage stays unknown."""
+    factory = worker_audit_session_factory
+    worker = Worker(factory, "budget-report")
+    create_eligible_task(factory)
+    run_id = worker.claim_once().run_id
+    with factory.begin() as session:
+        execution = AgentExecution(
+            run_id=run_id, agent_role=AgentRole.EXPLORER.value.lower(),
+            status=AgentExecutionStatus.SUCCEEDED, input={}, output={},
+            llm_usage={"model_requests": {
+                "settled": {"worker_id": "w", "reserved_tokens": 4096,
+                            "actual_usage": {"input_tokens": 100, "output_tokens": 20}},
+                "pending": {"worker_id": "w", "reserved_tokens": 500, "actual_usage": None},
+            }})
+        session.add(execution)
+
+    with factory() as session, session.begin():
+        coordinator = RunCoordinator(session)
+        policy = coordinator.assert_execution_right(run_id, worker.worker_id)
+        budget = coordinator.model_token_budget(run_id, policy)
+
+    assert budget["legacy_usage"] is False and budget["unsettled"] == 1
+    assert budget["used"] == 120 + 500
+    assert budget["remaining"] == policy.budget.max_llm_tokens_per_run - 620
+
+    with factory.begin() as session:
+        session.add(AgentExecution(
+            run_id=run_id, agent_role=AgentRole.PLANNER.value.lower(),
+            status=AgentExecutionStatus.FAILED, input={}, output={},
+            llm_usage={"prompt": "legacy usage without per-request records"}))
+    with factory() as session, session.begin():
+        coordinator = RunCoordinator(session)
+        policy = coordinator.assert_execution_right(run_id, worker.worker_id)
+        legacy = coordinator.model_token_budget(run_id, policy)
+
+    # Legacy usage cannot be charged reliably, so the remaining amount is unknown, not zero.
+    assert legacy["legacy_usage"] is True and legacy["remaining"] is None

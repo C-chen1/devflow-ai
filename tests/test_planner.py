@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from devflow_ai.planner import NeedsEvidence, PlannerOutput, PlanReady
+from devflow_ai.planner import NeedsEvidence, PlannerOutput, PlanReady, build_planner_prompt
 
 
 PLAN = {
@@ -41,3 +41,16 @@ def test_planner_output_rejects_invalid_or_mixed_branches(payload, error_type):
     with pytest.raises(ValidationError) as exc_info:
         PlannerOutput.model_validate(payload)
     assert error_type in {error["type"] for error in exc_info.value.errors()}
+
+
+def test_the_planner_prompt_separates_a_tool_truncation_from_a_clipped_prompt():
+    """A complete read is not the same thing as "the Planner has seen the whole file"."""
+    prompt = build_planner_prompt({"issue": {"title": "t", "description": "d"}, "read_evidence": []})
+
+    assert "`truncated` means the tool cut the read" in prompt
+    assert "`preview_clipped` means the content actually placed in this prompt was cut" in prompt
+    assert "A complete tool read does not mean you have seen all of it" in prompt
+    # And the way out is an explicit evidence request, not a guess.
+    assert "NEEDS_EVIDENCE with the gap and the affected decision" in prompt
+    # A gap inside a file is named as lines, not as "send the whole file again".
+    assert "name the file and the lines you need" in prompt

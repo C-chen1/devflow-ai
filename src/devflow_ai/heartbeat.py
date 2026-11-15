@@ -2,10 +2,12 @@
 from __future__ import annotations
 from threading import Event, Lock, Thread, current_thread
 from uuid import UUID
-from sqlalchemy import event, text
+from sqlalchemy import event, select, text
 from sqlalchemy.orm import Session, sessionmaker
 from devflow_ai.config import HeartbeatConfig, LeaseConfig
-from devflow_ai.coordinator import LeaseRenewal, RunCoordinator
+from devflow_ai.coordinator import LeaseRenewal, RunCoordinator, RunExecutionDeniedError
+from devflow_ai.enums import RunStatus
+from devflow_ai.models import Run
 import json
 import logging
 
@@ -114,7 +116,19 @@ class RunHeartbeat:
             while not self.heartbeat_stop_event.wait(self._lease_config.heartbeat_interval_seconds):
                 if self.execution_stop_event.is_set():
                     return
-                receipt = self._renew_once()
+                try:
+                    receipt = self._renew_once()
+                except RunExecutionDeniedError:
+                    if self._run_passed_for_this_worker():
+                        # This execution's own formal transaction committed the Run while the
+                        # loop was sleeping. Renewing it is meaningless and reporting the
+                        # denial as a failure would turn a correct result into an error, so
+                        # the loop ends quietly. Every other denial — an expired lease,
+                        # another owner, a Run failed or closed elsewhere — is still a
+                        # failure, and so is a status read that cannot be trusted.
+                        self._log_event("run_heartbeat_run_passed")
+                        return
+                    raise
                 with self._result_lock:
                     self._last_renewal = receipt
                 logger.info(json.dumps({
@@ -126,6 +140,34 @@ class RunHeartbeat:
             # Thread boundary: even an unexpected thread exit must notify the owner.
             self._record_failure(error)
             self._log_failure("run_heartbeat_failed", error)
+
+    def _run_passed_for_this_worker(self) -> bool:
+        """Whether *this* execution's formal commit produced the PASSED this Run shows.
+
+        Status alone is not enough: a replacement worker can take the Run over, commit it and
+        leave the previous owner staring at a PASSED Run it no longer owns. Quietly ending
+        there would hide the lost execution right, so the owner recorded on the Run must also
+        still be this worker. That comparison closes the window as well — a Run can only be
+        taken over while it is RUNNING with an expired lease, so a PASSED Run cannot be
+        re-owned after this execution committed it.
+
+        A read failure answers ``False`` on purpose: a database that cannot be read is not
+        evidence that this execution succeeded, so the denial stays a failure.
+        """
+        try:
+            with self.session_factory() as session:
+                row = session.execute(
+                    select(Run.status, Run.worker_id).where(Run.id == self.run_id)).first()
+        except Exception:
+            return False
+        if row is None:
+            return False
+        status, owner = row
+        return status is RunStatus.PASSED and owner == self.worker_id
+
+    def _log_event(self, event_name: str) -> None:
+        logger.info(json.dumps({"event": event_name, "run_id": str(self.run_id),
+                                "worker_id": self.worker_id}))
 
     def _renew_once(self) -> LeaseRenewal:
         with self.session_factory() as session:

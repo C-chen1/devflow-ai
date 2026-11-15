@@ -154,6 +154,22 @@ class ToolCallRepository:
         self.session.flush()
         return call.id
 
+    def mark_result_unknown(self, call_id: UUID, *, reason: str) -> int:
+        """Record that a pending call's outcome cannot be determined.
+
+        Kept apart from ``save_result``: that method stores a known outcome, while this
+        one states that no outcome can be proven for a call that may have started.
+        """
+        statement = (
+            update(ToolCall)
+            .where(
+                ToolCall.id == call_id,
+                ToolCall.status.in_((ToolCallStatus.REQUESTED, ToolCallStatus.RUNNING)),
+            )
+            .values(status=ToolCallStatus.UNKNOWN_RESULT, reason=reason)
+        )
+        return self.session.execute(statement).rowcount
+
     def save_result(
         self, call_id: UUID, *, status: ToolCallStatus,
         stdout_excerpt: str | None = None, stderr_excerpt: str | None = None,

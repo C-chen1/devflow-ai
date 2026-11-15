@@ -61,6 +61,19 @@ class Run(Base):
             unique=True,
             postgresql_where=text("status = 'RUNNING'"),
         ),
+        CheckConstraint(
+            "recovery_action IS NULL OR recovery_action IN "
+            "('REVISE_IMPLEMENTATION', 'REDIAGNOSE')",
+            name="ck_runs_recovery_action",
+        ),
+        CheckConstraint(
+            "recovery_start_tracking IS NULL OR recovery_start_tracking = 'v1'",
+            name="ck_runs_recovery_start_tracking",
+        ),
+        CheckConstraint(
+            "recovery_started_at IS NULL OR recovery_start_tracking IS NOT NULL",
+            name="ck_runs_recovery_start_recorded",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(
@@ -70,6 +83,12 @@ class Run(Base):
         Uuid(as_uuid=True), ForeignKey("tasks.id"), nullable=False
     )
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    # NULL on initial Runs and on legacy recovery Runs created before the marker existed.
+    recovery_action: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The durable event for an actually started recovery Run. NULL means either
+    # not started yet (tracking v1) or an untracked legacy Run (tracking NULL).
+    recovery_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    recovery_start_tracking: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[RunStatus] = mapped_column(
         Enum(RunStatus, name="run_status"), nullable=False
     )
@@ -210,6 +229,35 @@ class Verification(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class TaskReview(Base):
+    """One human review of a Task's formally passed Run.
+
+    Append-only: a review is evidence, so it is never rewritten. The record it points at is
+    identified by digest, which is also what makes a repeated submission idempotent. Both
+    times are kept on purpose: ``reviewed_at`` is the human's own timestamp from the record,
+    ``created_at`` is when this row was written, taken from the database.
+    """
+
+    __tablename__ = "task_reviews"
+    __table_args__ = (
+        UniqueConstraint("task_id", "record_sha256", name="uq_task_reviews_task_record"),
+        CheckConstraint("conclusion IN ('accepted', 'rejected')", name="ck_task_reviews_conclusion"),
+        CheckConstraint("record_sha256 ~ '^[0-9a-f]{64}$'", name="ck_task_reviews_record_sha256"),
+        Index("ix_task_reviews_task_id", "task_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    task_id: Mapped[UUID] = mapped_column(ForeignKey("tasks.id", name="fk_task_reviews_task_id"), nullable=False)
+    run_id: Mapped[UUID] = mapped_column(ForeignKey("runs.id", name="fk_task_reviews_run_id"), nullable=False)
+    verification_id: Mapped[UUID] = mapped_column(
+        ForeignKey("verifications.id", name="fk_task_reviews_verification_id"), nullable=False)
+    record_sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    conclusion: Mapped[str] = mapped_column(Text, nullable=False)
+    reviewer: Mapped[str] = mapped_column(Text, nullable=False)
+    reviewed_at: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class FailureRecord(Base):

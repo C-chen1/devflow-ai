@@ -11,6 +11,8 @@ import _winapi
 import msvcrt
 import subprocess
 
+from devflow_ai.process_evidence import mark_process_not_started
+
 
 _CREATE_SUSPENDED = 0x00000004
 _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
@@ -198,17 +200,21 @@ def start_windows_job_process(
 ):
     """Start a process in a new Job and keep its handles open through the context."""
     with ExitStack() as owned_handles:
-        job_handle = _create_job(None, None)
-        if not job_handle:
-            raise ctypes.WinError(ctypes.get_last_error())
-        owned_handles.callback(_winapi.CloseHandle, job_handle)
-        limits = _JobExtendedLimits()
-        limits.basic.limit_flags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if not _set_job(
-            job_handle, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-            ctypes.byref(limits), ctypes.sizeof(limits),
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            job_handle = _create_job(None, None)
+            if not job_handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            owned_handles.callback(_winapi.CloseHandle, job_handle)
+            limits = _JobExtendedLimits()
+            limits.basic.limit_flags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not _set_job(
+                job_handle, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(limits), ctypes.sizeof(limits),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+        except OSError as error:
+            # No child exists yet, so this boundary can prove non-execution.
+            raise mark_process_not_started(error)
 
         with open(devnull, "rb") as stdin, ExitStack() as inherited_handles:
             current_process = _winapi.GetCurrentProcess()
@@ -225,11 +231,16 @@ def start_windows_job_process(
                 hStdInput=std_handles[0], hStdOutput=std_handles[1], hStdError=std_handles[2],
                 lpAttributeList={"handle_list": std_handles},
             )
-            process_handle, thread_handle, _, _ = _winapi.CreateProcess(
-                None, subprocess.list2cmdline(args), None, None, True,
-                _CREATE_SUSPENDED | _winapi.CREATE_NO_WINDOW, env,
-                str(cwd) if cwd is not None else None, startup,
-            )
+            try:
+                process_handle, thread_handle, _, _ = _winapi.CreateProcess(
+                    None, subprocess.list2cmdline(args), None, None, True,
+                    _CREATE_SUSPENDED | _winapi.CREATE_NO_WINDOW, env,
+                    str(cwd) if cwd is not None else None, startup,
+                )
+            except OSError as error:
+                # CreateProcess failing means no child exists yet; anything that fails
+                # after this point leaves the outcome unknown.
+                raise mark_process_not_started(error)
             owned_handles.callback(_winapi.CloseHandle, process_handle)
             process = WindowsJobProcess(args, process_handle, job_handle)
             try:

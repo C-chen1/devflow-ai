@@ -1,4 +1,5 @@
 from uuid import uuid4
+import json
 import os
 import subprocess
 import sys
@@ -7,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from devflow_ai.verifier import (
+    SemanticReadRequest,
     CheckResult, DeterministicCheck, SemanticReview, VerificationOutcome, combine_verification_gates,
     TestCaseObservation as CaseObservation, TestSuiteReport as SuiteReport, compare_test_reports,
     SemanticDraft, SemanticModelBudgetUnavailableError, SemanticReviewDraft, VerificationEvidenceCoverage, build_semantic_review_prompt,
@@ -118,8 +120,8 @@ def test_semantic_loop_reads_then_validates_exact_review():
     def request(prompt):
         prompts.append(prompt)
         return next(responses)
-    def read(path):
-        assert path == "auth.py"
+    def read(path, offset=None, limit=None):
+        assert (path, offset, limit) == ("auth.py", None, None)
         return {"tool_call_id": str(call_id), "status": "succeeded", "preview": "check_permission()"}
     def validate(review):
         validated.append(review)
@@ -132,7 +134,7 @@ def test_semantic_loop_reads_then_validates_exact_review():
 
 
 def test_semantic_loop_limits_reads_and_repairs_and_propagates_budget_failure():
-    def never_read(_path):
+    def never_read(*_args, **_kwargs):
         pytest.fail("No read should be permitted")
     blocked = run_semantic_review(
         {}, request_model=lambda _: {"outcome": "READ_FILE", "path": "x.py"}, read_file=never_read,
@@ -293,3 +295,45 @@ def test_parse_report_generated_by_real_pytest(tmp_path):
 def test_parse_report_rejects_incomplete_or_ambiguous_input(report):
     with pytest.raises(ValueError):
         parse_pytest_junit_report(report, tool_call_id=uuid4(), command_name="test")
+
+
+def test_semantic_loop_can_read_a_line_range_and_sees_what_it_got():
+    """The review may ask for a window; the next turn is shown the window that arrived."""
+    call_id = uuid4()
+    responses = iter((
+        {"outcome": "READ_FILE", "path": "core.py", "offset": 2530, "limit": 350},
+        {"outcome": "REVIEW", "result": "passed", "reason": "Reviewed", "citations": [{
+            "source": "read_file", "tool_call_id": str(call_id), "path": "core.py",
+            "snippet": "class Option:", "reason": "The option class is here",
+        }]},
+    ))
+    prompts = []
+    calls = []
+
+    def request(prompt):
+        prompts.append(prompt)
+        return next(responses)
+
+    def read(path, offset=None, limit=None):
+        calls.append((path, offset, limit))
+        return {"tool_call_id": str(call_id), "status": "succeeded", "preview": "class Option:",
+                "start_line": 2641, "end_line": 2700, "total_lines": 5000, "has_more": True,
+                "byte_truncated": False, "partial_line": False}
+
+    result = run_semantic_review({"issue": "auth"}, request_model=request, read_file=read,
+                                 validate_review=lambda value: value, max_reads=1, max_repairs=0)
+
+    assert calls == [("core.py", 2530, 350)]
+    assert result.read_call_ids == (call_id,)
+    context = json.loads(prompts[1].split("Input data JSON:\n", 1)[1])
+    read_record = context["reads"][0]
+    assert read_record["start_line"] == 2641 and read_record["total_lines"] == 5000
+
+
+def test_a_read_request_rejects_a_zero_line():
+    with pytest.raises(ValidationError):
+        SemanticReadRequest.model_validate({"outcome": "READ_FILE", "path": "x.py", "offset": 0})
+
+    request = SemanticReadRequest.model_validate(
+        {"outcome": "READ_FILE", "path": "x.py", "offset": 10, "limit": 5})
+    assert (request.offset, request.limit) == (10, 5)

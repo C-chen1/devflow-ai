@@ -137,7 +137,10 @@ def test_real_heartbeat_denial_notifies_owner_and_closes_session(run_session_fac
             assert heartbeat.execution_stop_event.wait(5)
     assert heartbeat.failure is exc_info.value
     assert not heartbeat.is_alive()
-    assert len(sessions) == len(closed) == 1
+    # Every session opened here was closed cleanly. A denial also costs one read to learn
+    # whether the Run had already passed, so the count is not assumed to be exactly one.
+    assert len(sessions) == len(closed)
+    assert all(not session.in_transaction() for session, _ in closed)
     assert not closed[0][0].in_transaction()
     with run_session_factory() as session:
         run = session.get(Run, claim.run_id)
@@ -201,3 +204,61 @@ def test_real_heartbeat_shutdown_timeout_reports_alive_thread_until_lock_release
     assert len(sessions) == len(closed) == 1
     with pytest.raises(HeartbeatShutdownError):
         heartbeat.raise_if_failed()
+
+
+def test_a_heartbeat_stops_quietly_once_its_own_execution_has_passed(run_session_factory):
+    """This worker's own commit ends the loop: renewing is meaningless, and it is not an error."""
+    claim = create_claim(run_session_factory)
+    with run_session_factory() as session:
+        run = session.get(Run, claim.run_id)
+        # The formal transaction does not change the owner; this worker still holds the Run.
+        assert run.worker_id == claim.worker_id
+        run.status = RunStatus.PASSED
+        run.finished_at = get_database_time(session)
+        session.commit()
+    factory, sessions, closed, _ = tracking_factory(run_session_factory)
+    heartbeat = make_heartbeat(factory, claim)
+
+    with heartbeat:
+        deadline = monotonic() + 5
+        while heartbeat.is_alive() and monotonic() < deadline:
+            sleep(0.05)
+        assert not heartbeat.is_alive(), "the loop should end once the Run has passed"
+
+    assert heartbeat.failure is None
+    assert heartbeat.last_renewal is None
+    # A finished Run does not ask the main flow to stop: its own work is what finished it.
+    assert not heartbeat.execution_stop_event.is_set()
+    # One session for the renewal attempt and one for reading the Run's status.
+    assert len(sessions) == len(closed) == 2
+
+
+def test_a_pass_by_another_owner_does_not_hide_lost_execution_right(run_session_factory):
+    """A replacement owner's pass is not this execution's result: the old owner must stop."""
+    claim = create_claim(run_session_factory)
+    with run_session_factory() as session:
+        run = session.get(Run, claim.run_id)
+        run.worker_id = "replacement-worker"
+        run.status = RunStatus.PASSED
+        run.finished_at = get_database_time(session)
+        session.commit()
+    heartbeat = make_heartbeat(run_session_factory, claim)
+    heartbeat.start()
+    try:
+        assert heartbeat.execution_stop_event.wait(5), "a previous owner must be stopped"
+    finally:
+        heartbeat.stop()
+    assert isinstance(heartbeat.failure, RunExecutionDeniedError)
+
+
+def test_a_status_read_that_fails_is_not_taken_as_success(run_session_factory):
+    """Only a readable PASSED owned by this worker counts; an unreadable status does not."""
+    claim = create_claim(run_session_factory)
+    heartbeat = make_heartbeat(run_session_factory, claim)
+
+    def unavailable():
+        raise RuntimeError("database unavailable")
+
+    heartbeat.session_factory = unavailable
+
+    assert heartbeat._run_passed_for_this_worker() is False
