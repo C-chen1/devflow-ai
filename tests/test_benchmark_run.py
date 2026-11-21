@@ -427,3 +427,34 @@ def test_the_cli_refuses_a_task_that_already_has_a_run(tmp_path, capsys):
     assert exit_code == 2
     assert "already has a Run" in capsys.readouterr().err
     assert not record.exists()
+
+
+def test_the_entry_requires_the_manifest_and_its_pin_together(tmp_path):
+    from devflow_ai.benchmark_run import _verified_execution_sha256
+
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    for request in (
+        SimpleNamespace(execution_manifest=manifest, execution_sha256=None),
+        SimpleNamespace(execution_manifest=None, execution_sha256="1" * 64),
+    ):
+        with pytest.raises(BenchmarkRunError, match="must be supplied together"):
+            _verified_execution_sha256(request)
+
+
+def test_the_entry_refuses_a_manifest_that_disagrees_with_its_pin(tmp_path):
+    from devflow_ai.benchmark_run import _verified_execution_sha256
+    from devflow_ai.execution_binding import package_modules, running_package_root
+    from devflow_ai.execution_manifest import build_manifest, manifest_sha256
+
+    root = running_package_root()
+    manifest = build_manifest(root, package_modules(root))
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(manifest.model_dump_json(), encoding="utf-8")
+    digest = manifest_sha256(manifest)
+
+    assert _verified_execution_sha256(SimpleNamespace(
+        execution_manifest=manifest_path, execution_sha256=digest)) == digest
+    with pytest.raises(BenchmarkRunError, match="Execution binding refused"):
+        _verified_execution_sha256(SimpleNamespace(
+            execution_manifest=manifest_path, execution_sha256="f" * 64))

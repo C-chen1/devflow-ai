@@ -14,7 +14,7 @@ from devflow_ai.enums import AgentRole, TaskStatus
 REPO_ROOT = Path(__file__).resolve().parents[1]
 from devflow_ai.models import Task
 from devflow_ai.policy import build_default_policy
-from devflow_ai.task_pack import load_manifest
+from devflow_ai.task_pack import admission_has_scope_digest, load_manifest, scope_evidence_sha256
 
 
 def _pack(tmp_path):
@@ -121,6 +121,12 @@ def test_the_task_is_created_and_admitted_at_the_pack_commit(run_session_factory
         task = session.get(Task, task_id)
         assert task.status == TaskStatus.ELIGIBLE
         assert task.base_commit == manifest.base_commit
+        digest = scope_evidence_sha256(manifest.scope)
+        assert admission_has_scope_digest(task.admission_record, digest)
+        assert not admission_has_scope_digest(task.admission_record, "0" * 64)
+        ambiguous = {"evidence": [f"pack:{manifest.pack_id}", f"scope-sha256-v1:{digest}",
+                                  f"scope-sha256-v1:{digest}"]}
+        assert not admission_has_scope_digest(ambiguous, digest)
         assert task.policy_snapshot["policy_version"] == policy.policy_version
         roles = task.policy_snapshot["permissions"]["allowed_tools_by_role"]
         coder_tools = next(value for key, value in roles.items() if key.lower() == "coder")

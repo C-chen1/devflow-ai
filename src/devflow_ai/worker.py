@@ -14,17 +14,20 @@ from devflow_ai.artifacts import ToolArtifactResult, write_artifact_file
 from devflow_ai.baseline import BaselineUnavailableError, validate_coder_baseline, validate_recorded_baseline
 from devflow_ai.coder import CoderBlocked, CoderDraft, CoderReadRequest, CoderOutput, PatchReady, build_coder_prompt
 from devflow_ai.config import HeartbeatConfig, LeaseConfig
-from devflow_ai.context import ContextBuilder
+from devflow_ai.context import ContextBuilder, MEMORY_RECALL_CONTEXT_KEY
 from devflow_ai.coordinator import (
     HandoffContext, HandoffDecision, ReadFileReceipt, RunCoordinator, RunExecutionDeniedError,
     LEASE_EXPIRED_SIGNATURE, RecoveryDecisionUnavailableError, RunLeaseNotExpiredError,
+    RunVersionConflictError,
 )
 from devflow_ai.database import create_db_engine, create_session_factory
+from devflow_ai.execution_binding import verify_optional_binding
 from devflow_ai.enums import AgentExecutionStatus, AgentRole, FailureCategory, RunStatus, ToolCallStatus, VerificationResult
 from devflow_ai.explorer import ExplorerResult, explore_one_file
 from devflow_ai.harness import GitExecutionCancelledError
 from devflow_ai.heartbeat import RunHeartbeat
 from devflow_ai.model_gateway import ModelGateway, PlannerModelGateway
+from devflow_ai.memory import MemoryRecallRequest, MemoryService, RepositoryScope
 from devflow_ai.orchestration import CommittedHandoff, HandoffRoutingError, run_handoff_cycle
 from devflow_ai.models import AgentExecution, Artifact, FailureRecord, Handoff, Run, Task, ToolCall, Verification
 from devflow_ai.planner import NeedsEvidence, PlannerOutput, PlannerRawOutput, PlannerRepairRequest
@@ -262,6 +265,21 @@ class Worker:
                 creation_idempotency_key=run.creation_idempotency_key,
                 lease_expires_at=run.lease_expires_at.astimezone(timezone.utc),
             )
+
+    def _require_run_execution_version(self, run_id: UUID, verified: str | None) -> None:
+        """Refuse to execute a Run under a version other than the one it recorded.
+
+        Read-only and before any workspace or Agent work. A Run claimed without a pinned
+        manifest keeps the V1 behaviour; a Run claimed with one is executable only by a caller
+        that just verified the same bytes.
+        """
+        with self.session_factory() as session:
+            pinned = session.scalar(select(Run.execution_sha256).where(Run.id == run_id))
+        if pinned is None:
+            return
+        if verified != pinned:
+            raise RunVersionConflictError(
+                "This Run was started under a different execution version; refusing to execute it")
 
     def execute_initial_supervisor(
         self, run_id: UUID, *, model_gateway: ModelGateway, stop_event: Event,
@@ -808,6 +826,7 @@ class Worker:
         verifier_gateway: ModelGateway | None = None, verifier_target_tests: tuple[str, ...] = (),
         verifier_max_diff_bytes: int | None = None,
         verification_config: VerificationConfig | None = None,
+        memory_recall: MemoryRecallRequest | None = None,
     ) -> dict[AgentRole, Callable[[CommittedHandoff], None]]:
         """Bind committed handoffs to the existing Explorer and Planner entry points."""
         public_tests_digest: dict[str, str] | None = None
@@ -828,7 +847,9 @@ class Worker:
             # Digest the copy that will actually run, so acceptance can compare it with
             # the trusted pack instead of trusting a path.
             public_tests_digest = copied_public_tests_sha256(directories.artifact_root)
+        pending_recall = memory_recall
         def receive_explorer(handoff: CommittedHandoff) -> None:
+            nonlocal pending_recall
             with self.session_factory() as session:
                 builder = ContextBuilder(session)
                 agent_input = builder.build_issue_context(run_id)
@@ -841,9 +862,11 @@ class Worker:
                 if already_read:
                     agent_input["already_read"] = already_read
             agent_input["handoff"] = handoff.context
+            selected_recall, pending_recall = pending_recall, None
             self.execute_explorer(
                 run_id, directories=directories, max_bytes=max_bytes, stop_event=stop_event,
                 agent_input=agent_input, model_gateway=explorer_gateway, handoff_id=handoff.id,
+                **({"memory_recall": selected_recall} if selected_recall is not None else {}),
             )
 
         def receive_planner(handoff: CommittedHandoff) -> None:
@@ -962,15 +985,31 @@ class Worker:
                 run_id, self.worker_id, role=AgentRole.VERIFIER,
                 agent_input={"purpose": "post_patch_verification", "command_name": command_name}, handoff_id=handoff_id)
         try:
-            receipt = self.build_verifier_command(run_id, agent_execution_id=execution_id, directories=directories,
-                registry=registry, stop_event=stop_event, pytest_command_names=frozenset({command_name}),
-                pythonpath_relative=pythonpath_relative,
-                public_tests_digest=public_tests_digest)(command_name)
+            from devflow_ai.skills import run_registered_check
+            receipt = run_registered_check(version="2", worker=self, run_id=run_id,
+                verifier_execution_id=execution_id, directories=directories, registry=registry,
+                command_name=command_name, stop_event=stop_event, trusted_pytest_capture=True,
+                trusted_pythonpath_relative=pythonpath_relative,
+                trusted_public_tests_digest=public_tests_digest)["receipt"]
             reports = [item for item in receipt["artifacts"] if item["kind"] == "pytest_junit"]
             if len(reports) != 1:
                 raise VerificationEvidenceError("Current pytest report is unavailable")
-            diff = self.build_verifier_diff(run_id, agent_execution_id=execution_id, directories=directories,
-                max_bytes=max_diff_bytes, stop_event=stop_event)()
+            from devflow_ai.skills import check_diff_scope, supports_diff_scope
+            from devflow_ai.task_pack import admission_has_scope_digest, scope_evidence_sha256
+            scope = verification_config.scope if verification_config is not None else None
+            with self.session_factory() as session:
+                admission = session.scalar(select(Task.admission_record).join(Run, Run.task_id == Task.id)
+                                           .where(Run.id == run_id))
+            scope_check = None
+            if (scope is not None and supports_diff_scope(scope, max_diff_bytes)
+                    and admission_has_scope_digest(admission, scope_evidence_sha256(scope))):
+                scope_check = check_diff_scope(version="2", worker=self, run_id=run_id,
+                    verifier_execution_id=execution_id, directories=directories,
+                    trusted_scope=scope, max_diff_bytes=max_diff_bytes, stop_event=stop_event)
+                diff = scope_check
+            else:
+                diff = self.build_verifier_diff(run_id, agent_execution_id=execution_id, directories=directories,
+                    max_bytes=max_diff_bytes, stop_event=stop_event)()
             selection = VerifierEvidenceSelection(baseline_verifier_id=baseline_id, baseline_call_id=baseline_call_id,
                 baseline_artifact_id=baseline_artifact_id, patch_call_id=patch_id,
                 current_call_id=UUID(receipt["tool_call_id"]), current_artifact_id=UUID(reports[0]["id"]),
@@ -988,9 +1027,11 @@ class Worker:
                     agent_execution_id=execution_id, draft_artifact_id=review.draft_artifact_id,
                     missing_evidence=readiness.missing_evidence,
                     preliminary_public_outcome=preliminary_public_outcome(review.comparison, review.review).value,
+                    scope_check=scope_check,
                     external_connections_declaration=(verification_config.external_connections
                                                       if verification_config is not None else "unknown"))
-            return {"execution_id": execution_id, "readiness": readiness, "review": review}
+            return {"execution_id": execution_id, "readiness": readiness, "review": review,
+                    "scope_check": scope_check}
         except RunExecutionDeniedError:
             raise
         except Exception as error:
@@ -2287,6 +2328,13 @@ class Worker:
         if not self._independent_evaluation_material_is_valid(material, directories):
             return {"outcome": "verifier_blocked", "reason": "independent_evaluation_material_invalid"}
         try:
+            with self.session_factory() as session, session.begin():
+                coordinator = RunCoordinator(session, self.lease_config)
+                coordinator.assert_execution_right(run_id, self.worker_id)
+                coordinator.assert_independent_memory_isolation(run_id)
+        except VerificationEvidenceError:
+            return {"outcome": "verifier_blocked", "reason": "memory_context_precludes_independent_evaluation"}
+        try:
             verifier_id = UUID(str(result["verifier_execution_id"]))
             draft_id = UUID(str(result["draft_artifact_id"]))
         except (KeyError, TypeError, ValueError):
@@ -2772,17 +2820,28 @@ class Worker:
         self, task_id: UUID, *, creation_idempotency_key: str, workspaces_root: Path, artifacts_root: Path,
         supervisor_gateway: ModelGateway, explorer_gateway: ModelGateway, planner_gateway: PlannerModelGateway,
         max_read_bytes: int, stop_event: Event,
+        execution_manifest: Path | None = None, execution_sha256: str | None = None,
     ) -> dict:
-        """Start one approved retry and dispatch its first Supervisor-to-Explorer handoff."""
+        """Start one approved retry and dispatch its first Supervisor-to-Explorer handoff.
+
+        ``execution_manifest``/``execution_sha256`` mirror the one-shot entry: verified before
+        the retry Run is created, and the verified digest must equal what this Task's earlier
+        Runs recorded. A Task whose history is already pinned cannot be recovered without the
+        same manifest — that refusal is deliberate, not an oversight.
+        """
         if max_read_bytes <= 0 or stop_event is None:
             raise ValueError("A positive read limit and stop event are required")
+        execution_sha256 = verify_optional_binding(
+            manifest_path=execution_manifest, expected_sha256=execution_sha256,
+            require_complete=True)
         if not workspaces_root.resolve(strict=True).is_dir() or not artifacts_root.resolve(strict=True).is_dir():
             raise ValueError("Workspace and artifact roots must be existing directories")
         if stop_event.is_set():
             raise GitExecutionCancelledError("Recovery stopped before retry creation")
         with self.session_factory() as session:
             run, created = RunCoordinator(session, self.lease_config).start_retry_run(
-                task_id, self.worker_id, creation_idempotency_key)
+                task_id, self.worker_id, creation_idempotency_key,
+                execution_sha256=execution_sha256)
             retry_id = run.id
         if not created:
             return {"outcome": "existing_retry", "run_id": retry_id, "handoff_id": None}
@@ -2799,6 +2858,7 @@ class Worker:
         coder_gateway: ModelGateway | None = None, max_patch_bytes: int | None = None,
         verifier_gateway: ModelGateway | None = None, verifier_max_diff_bytes: int | None = None,
         independent_evaluation: IndependentEvaluationMaterial | None = None,
+        execution_manifest: Path | None = None, execution_sha256: str | None = None,
     ) -> dict:
         """Start or resume one rediagnosis Run through Coder and its Supervisor route.
 
@@ -2819,13 +2879,19 @@ class Worker:
         """
         if max_read_bytes <= 0 or stop_event is None:
             raise ValueError("A positive read limit and stop event are required")
+        # Same rule as every other creation path: verify the pinned manifest before the Run
+        # exists, and refuse to continue a history that is pinned to another version.
+        execution_sha256 = verify_optional_binding(
+            manifest_path=execution_manifest, expected_sha256=execution_sha256,
+            require_complete=True)
         if not workspaces_root.resolve(strict=True).is_dir() or not artifacts_root.resolve(strict=True).is_dir():
             raise ValueError("Workspace and artifact roots must be existing directories")
         if stop_event.is_set():
             raise GitExecutionCancelledError("Recovery stopped before rediagnosis creation")
         with self.session_factory() as session:
             run, created = RunCoordinator(session, self.lease_config).start_rediagnosis_run(
-                task_id, self.worker_id, creation_idempotency_key)
+                task_id, self.worker_id, creation_idempotency_key,
+                execution_sha256=execution_sha256)
             retry_id = run.id
             run_status = run.status
         if run_status != RunStatus.RUNNING:
@@ -3360,6 +3426,7 @@ class Worker:
         require_unpatched: bool = False,
         verify_baseline: bool = False,
         public_tests_digest: Mapping[str, str] | None = None,
+        registered_check_skill_version: str | None = None,
     ) -> Callable[[str], dict]:
         """Bind server-approved command names to one Verifier execution."""
         registered_commands = {name: tuple(command) for name, command in registry.items()}
@@ -3379,6 +3446,7 @@ class Worker:
                     require_unpatched=require_unpatched,
                     verify_baseline=verify_baseline,
                     public_tests_sha256=public_tests_digest,
+                    registered_check_skill_version=registered_check_skill_version,
                 )
             with self.session_factory() as session:
                 return load_verifier_command_evidence(session, run_id, agent_execution_id, (call_id,))[0]
@@ -3413,10 +3481,12 @@ class Worker:
                 agent_input={"purpose": "baseline", "command_name": command_name}, handoff_id=handoff_id,
             )
         try:
-            receipt = self.build_verifier_command(run_id, agent_execution_id=execution_id, directories=directories,
-                registry=registry, stop_event=stop_event, pytest_command_names=frozenset({command_name}),
-                pythonpath_relative=pythonpath_relative, require_unpatched=True, verify_baseline=verify_baseline,
-                public_tests_digest=public_tests_digest)(command_name)
+            from devflow_ai.skills import run_registered_check
+            receipt = run_registered_check(version="2", worker=self, run_id=run_id,
+                verifier_execution_id=execution_id, directories=directories, registry=registry,
+                command_name=command_name, stop_event=stop_event, trusted_pytest_capture=True,
+                trusted_pythonpath_relative=pythonpath_relative, trusted_require_unpatched=True,
+                trusted_verify_baseline=verify_baseline, trusted_public_tests_digest=public_tests_digest)["receipt"]
             reports = [item for item in receipt["artifacts"] if item["kind"] == "pytest_junit"]
             valid = (receipt["status"], receipt["exit_code"]) in (("succeeded", 0), ("failed", 1)) and len(reports) == 1
             if valid:
@@ -3452,6 +3522,8 @@ class Worker:
     def build_verifier_diff(
         self, run_id: UUID, *, agent_execution_id: UUID, directories: RunDirectories,
         max_bytes: int, stop_event: Event,
+        diff_scope_skill_sha256: str | None = None,
+        diff_scope_skill_version: str | None = None,
     ) -> Callable[[], dict]:
         """Bind a tracked-workspace diff reader to one Verifier execution."""
         if max_bytes <= 0:
@@ -3464,6 +3536,8 @@ class Worker:
                     run_id, self.worker_id, agent_execution_id=agent_execution_id,
                     workspace_root=directories.workspace_root, artifact_root=directories.artifact_root,
                     stop_event=stop_event,
+                    diff_scope_skill_sha256=diff_scope_skill_sha256,
+                    diff_scope_skill_version=diff_scope_skill_version,
                 )
             with self.session_factory() as session:
                 return load_verifier_workspace_diff(
@@ -3537,6 +3611,7 @@ class Worker:
         explore: Callable[[dict, Callable[[str], ReadFileReceipt]], ExplorerResult] | None = None,
         model_gateway: ModelGateway | None = None,
         handoff_id: UUID | None = None,
+        memory_recall: MemoryRecallRequest | None = None,
     ) -> UUID:
         """Register Explorer, run it with a bound reader, and commit its outcome."""
         if max_bytes <= 0:
@@ -3544,6 +3619,34 @@ class Worker:
         if (explore is None) == (model_gateway is None):
             raise ValueError("Explorer requires either a model gateway or a local callback")
         _require_run_not_stopped(run_id, stop_event)
+        if memory_recall is not None:
+            if not isinstance(memory_recall, MemoryRecallRequest) or MEMORY_RECALL_CONTEXT_KEY in agent_input:
+                raise ValueError("Memory recall requires one explicit trusted selection")
+            with self.session_factory() as session, session.begin():
+                RunCoordinator(session, self.lease_config).assert_execution_right(run_id, self.worker_id)
+                task_id, repository = session.execute(select(Run.task_id, Task.repo).join(
+                    Task, Task.id == Run.task_id).where(Run.id == run_id)).one()
+            with self.session_factory() as session:
+                prepared = MemoryService(session).prepare_recall(
+                    idempotency_key=memory_recall.idempotency_key, scope=RepositoryScope(repository),
+                    task_id=task_id, run_id=run_id, memory_id=memory_recall.memory_id,
+                    candidate_sha256=memory_recall.candidate_sha256, operator=memory_recall.operator,
+                    purpose=memory_recall.purpose, target_environment=memory_recall.target_environment)
+            candidate, use = prepared["candidate"], prepared["use"]
+            agent_input = {**agent_input, MEMORY_RECALL_CONTEXT_KEY: {
+                "use_id": use["id"], "candidate_id": candidate["id"],
+                "candidate_sha256": candidate["candidate_sha256"],
+                "content": candidate["content"], "content_status": candidate["content_status"],
+                "source_task_id": candidate["task_id"], "source_run_id": candidate["run_id"],
+                "source_verification_id": candidate["verification_id"],
+                "source_task_review_id": candidate["task_review_id"],
+                "source_artifact_id": candidate["artifact_id"],
+                "source_artifact_sha256": candidate["artifact_sha256"],
+                "source_state": candidate["source_state"], "review_id": use["review_id"],
+                "applicable_base_commit": candidate["applicable_base_commit"],
+                "applicable_environment": candidate["applicable_environment"],
+                "valid_until": candidate["valid_until"],
+            }}
         with self.session_factory() as session:
             execution_id = RunCoordinator(session, self.lease_config).start_agent_execution(
                 run_id, self.worker_id, role=AgentRole.EXPLORER, agent_input=agent_input, handoff_id=handoff_id,
@@ -3829,6 +3932,7 @@ class Worker:
         heartbeat_config: HeartbeatConfig,
         process_run: Callable[[RunDirectories, str, Event], RunResult],
         external_stop_event: Event | None = None,
+        execution_manifest: Path | None = None, execution_sha256: str | None = None,
     ) -> RunResult:
         """Run initialization and processing under one heartbeat for a committed claim.
 
@@ -3838,7 +3942,18 @@ class Worker:
         during the prepare step, and it is checked again afterwards. Outside calls that
         started before the deadline are not interrupted: a request to stop is not proof
         that execution has exited.
+
+        **The execution boundary verifies the version itself.** ``execution_manifest`` and
+        ``execution_sha256`` are verified here, before any workspace work, and the result must
+        equal the digest the Run recorded when it was claimed. A caller cannot pass a bare
+        digest and have it trusted; a Run started under a pinned version whose bytes are not
+        re-verified is refused. Runs created without a pin (the V1 path) stay executable, and
+        executing one under a verified manifest does not retroactively bind it.
         """
+        verified = verify_optional_binding(
+            manifest_path=execution_manifest, expected_sha256=execution_sha256,
+            require_complete=True)
+        self._require_run_execution_version(run_id, verified)
         if external_stop_event is not None and external_stop_event.is_set():
             raise GitExecutionCancelledError("Run deadline reached before initialization")
         with RunHeartbeat(

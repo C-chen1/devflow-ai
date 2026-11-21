@@ -7,24 +7,32 @@ counted here is a fixture value, not a real request.
 import json
 import subprocess
 import sys
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from threading import Barrier, Event
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import select
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from alembic.script import ScriptDirectory
+from sqlalchemy import select, text
 
 import devflow_ai.worker_run as worker_run_module
 from devflow_ai.benchmark_run import BenchmarkLimits
 from devflow_ai.config import HeartbeatConfig
 from devflow_ai.coordinator import ModelTokenUsage, RunCoordinator, RunExecutionDeniedError
-from devflow_ai.enums import AgentExecutionStatus, AgentRole, RunStatus, TaskStatus
+from devflow_ai.enums import AgentExecutionStatus, AgentRole, RunStatus, TaskStatus, VerificationResult
 from devflow_ai.model_gateway import ModelGateway, ModelReply, PlannerModelGateway
 from devflow_ai.model_gateways import ModelGateways, model_gateways_from_env
-from devflow_ai.models import AgentExecution, Run, Task, Verification
+from devflow_ai.memory import MemoryCandidate, MemoryRecallRequest, MemoryService, RepositoryScope
+from devflow_ai.models import AgentExecution, MemoryUse, Run, Task, Verification
 from devflow_ai.policy import build_default_policy
 from devflow_ai.services import AdmissionRecord, TaskService
+from devflow_ai.task_pack import load_manifest, scope_evidence_sha256
 from devflow_ai.worker import Worker
 from devflow_ai.worker_run import (
     WorkerRunError, WorkerRunExecutionError, WorkerRunRequest, main as worker_run_main,
@@ -42,6 +50,21 @@ EXPLORE_DECISION = {
     "reason": "The Issue needs repository evidence",
     "exploration_focus": "Locate the affected facts",
 }
+
+
+@pytest.fixture
+def worker_memory_session_factory(worker_session_factory):
+    engine = worker_session_factory.kw["bind"]
+    schema = engine.get_execution_options()["schema_translate_map"][None]
+    scripts = ScriptDirectory(str(Path(__file__).resolve().parents[1] / "migrations"))
+    with engine.begin() as connection:
+        connection.execution_options(schema_translate_map=None)
+        connection.execute(text(f'SET LOCAL search_path TO "{schema}", public'))
+        with Operations.context(MigrationContext.configure(connection)):
+            for revision in ("b7f2c31d8a90", "c4a7e2f19b30", "d18e42f70a91", "ec624a31d740",
+                             "f6a92c3184d2", "a5810e46f2c9", "b41e9d2c8370"):
+                scripts.get_revision(revision).module.upgrade()
+    return worker_session_factory
 
 
 def _pack(tmp_path, *, base_commit, target="scenarios::test_placeholder", write_tests=True):
@@ -161,6 +184,38 @@ def _request(setup, tmp_path, *, attempt_kind="rehearsal", **over):
     return WorkerRunRequest(**fields)
 
 
+def _selected_memory(factory, setup):
+    with factory() as session:
+        repository = session.get(Task, setup.task_id).repo
+    source_id = _task(factory, repository, setup.base_commit)
+    with factory() as session:
+        run, _ = RunCoordinator(session).start_initial_run(source_id, "memory-source", f"source:{source_id}")
+        source_run = run.id
+    with factory.begin() as session:
+        session.get(Run, source_run).status = RunStatus.PASSED
+        session.get(Task, source_id).status = TaskStatus.AWAITING_REVIEW
+        verification = Verification(run_id=source_run, result=VerificationResult.PASSED,
+            evidence={"scope": "trusted_v1", "suite_version": "fixture-suite"})
+        session.add(verification)
+        session.flush()
+        verification_id = verification.id
+    scope = RepositoryScope(repository)
+    with factory() as session:
+        item = MemoryService(session).ingest(MemoryCandidate(identity_key="dev-fixture", scope=scope,
+            source_kind="verification", task_id=source_id, run_id=source_run, verification_id=verification_id,
+            content="Read the fixture README.", created_by="operator-a", topic="fixture",
+            valid_until=datetime.now(timezone.utc) + timedelta(days=1),
+            applicable_base_commit=setup.base_commit, applicable_environment="fixture-env"))
+    with factory() as session:
+        shown = MemoryService(session).read(scope=scope, memory_id=UUID(item["id"]))
+    with factory() as session:
+        MemoryService(session).review(memory_id=UUID(item["id"]), scope=scope,
+            candidate_sha256=shown["candidate_sha256"], conclusion="accepted", reviewer="person", reason="reviewed")
+    return MemoryRecallRequest(idempotency_key=uuid4(), memory_id=UUID(item["id"]),
+        candidate_sha256=shown["candidate_sha256"], operator="operator-a", purpose="development exploration",
+        target_environment="fixture-env")
+
+
 @contextmanager
 def _gateways(session_factory, worker_id, *, output=None, error=None):
     def generate(prompt, limit):
@@ -258,6 +313,60 @@ def test_a_pack_for_another_commit_is_refused_before_a_run_exists(
     with pytest.raises(WorkerRunError, match="base commit"):
         prepare_worker_run(_request(setup, tmp_path), session_factory=factory)
 
+    assert _runs(factory, setup.task_id) == []
+
+
+@pytest.mark.parametrize("changed", ["scope", "pack_id", "duplicate"])
+def test_pinned_scope_mismatch_is_refused_before_claim(worker_session_factory, tmp_path, monkeypatch, changed):
+    factory = worker_session_factory
+    setup = _setup(factory, tmp_path, monkeypatch)
+    manifest = load_manifest(setup.pack)
+    marker = f"scope-sha256-v1:{scope_evidence_sha256(manifest.scope)}"
+    with factory.begin() as session:
+        session.get(Task, setup.task_id).admission_record = {
+            "reason": "fixture", "evidence": [f"pack:{manifest.pack_id}", marker]}
+    path = setup.pack / "task.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if changed == "scope":
+        payload["scope"]["allowed_paths"] = ["elsewhere/"]
+    elif changed == "pack_id":
+        payload["pack_id"] = "another-pack"
+    else:
+        with factory.begin() as session:
+            session.get(Task, setup.task_id).admission_record = {
+                "reason": "fixture", "evidence": [f"pack:{manifest.pack_id}", marker, marker]}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(WorkerRunError, match="scope binding"):
+        prepare_worker_run(_request(setup, tmp_path), session_factory=factory)
+    assert _runs(factory, setup.task_id) == []
+
+
+def test_admission_changed_after_preparation_is_refused_at_claim(worker_session_factory, tmp_path, monkeypatch):
+    factory = worker_session_factory
+    setup = _setup(factory, tmp_path, monkeypatch)
+    manifest = load_manifest(setup.pack)
+    with factory.begin() as session:
+        session.get(Task, setup.task_id).admission_record = {"reason": "fixture", "evidence": [
+            f"pack:{manifest.pack_id}", f"scope-sha256-v1:{scope_evidence_sha256(manifest.scope)}"]}
+    request = _request(setup, tmp_path)
+    prepared = prepare_worker_run(request, session_factory=factory)
+    with factory.begin() as session:
+        session.get(Task, setup.task_id).admission_record = {"reason": "changed", "evidence": []}
+    with pytest.raises(WorkerRunError, match="admission record changed"):
+        run_worker_once(request, session_factory=factory, worker=Worker(factory, "worker-run-entry"),
+                        gateways=None, heartbeat_config=HEARTBEAT, prepared=prepared)
+    assert _runs(factory, setup.task_id) == []
+
+
+def test_matching_scope_binding_is_accepted_during_preparation(worker_session_factory, tmp_path, monkeypatch):
+    factory = worker_session_factory
+    setup = _setup(factory, tmp_path, monkeypatch)
+    manifest = load_manifest(setup.pack)
+    with factory.begin() as session:
+        session.get(Task, setup.task_id).admission_record = {"reason": "fixture", "evidence": [
+            f"pack:{manifest.pack_id}", f"scope-sha256-v1:{scope_evidence_sha256(manifest.scope)}"]}
+    prepared = prepare_worker_run(_request(setup, tmp_path), session_factory=factory)
+    assert prepared.expected_admission_record["evidence"][-1] == f"scope-sha256-v1:{scope_evidence_sha256(manifest.scope)}"
     assert _runs(factory, setup.task_id) == []
 
 
@@ -659,6 +768,90 @@ def test_the_cli_needs_explicit_confirmation(worker_session_factory, tmp_path, m
     assert _runs(factory, setup.task_id) == []
 
 
+def test_memory_rehearsal_preflight_rejects_formal_and_benchmark_before_claim(
+    worker_memory_session_factory, tmp_path, monkeypatch,
+):
+    factory = worker_memory_session_factory
+    setup = _setup(factory, tmp_path, monkeypatch)
+    selection = _selected_memory(factory, setup)
+    request = _request(setup, tmp_path, memory_recall=selection)
+    prepared = prepare_worker_run(request, session_factory=factory)
+    assert prepared.existing_run_id is None
+    from devflow_ai.benchmark_record import AttemptKind
+    with pytest.raises(WorkerRunError, match="require rehearsal"):
+        run_worker_once(request, session_factory=factory, worker=Worker(factory, "fixture"), gateways=None,
+            heartbeat_config=HEARTBEAT, prepared=replace(prepared, attempt_kind=AttemptKind.FORMAL))
+    with pytest.raises(WorkerRunError, match="require rehearsal"):
+        prepare_worker_run(replace(request, attempt_kind="formal"), session_factory=factory)
+    with pytest.raises(WorkerRunError, match="no independent material"):
+        prepare_worker_run(replace(request, material_path=tmp_path / "unused"), session_factory=factory)
+    with pytest.raises(WorkerRunError, match="unavailable"):
+        prepare_worker_run(replace(request, memory_recall=replace(selection, candidate_sha256="0" * 64)),
+                           session_factory=factory)
+    with factory.begin() as session:
+        session.get(Task, setup.task_id).admission_record = {
+            "reason": "constructed benchmark", "evidence": ["pack:worker-entry-pack"]}
+    with pytest.raises(WorkerRunError, match="Memory selection is unavailable"):
+        prepare_worker_run(request, session_factory=factory)
+    assert _runs(factory, setup.task_id) == []
+
+
+def test_cli_runs_explicit_memory_rehearsal_without_formal_evaluation(
+    worker_memory_session_factory, tmp_path, monkeypatch, capsys,
+):
+    from devflow_ai.context import MEMORY_RECALL_CONTEXT_KEY
+
+    factory = worker_memory_session_factory
+    setup = _setup(factory, tmp_path, monkeypatch)
+    selection = _selected_memory(factory, setup)
+    supervisor_decisions = iter([EXPLORE_DECISION, BLOCKED_DECISION])
+    prompts = []
+    def supervisor(_prompt, _limit):
+        return ModelReply(next(supervisor_decisions), ModelTokenUsage(input_tokens=40, output_tokens=20))
+    def explorer(prompt, _limit):
+        data = json.loads(prompt.split("\nInput data JSON:\n", 1)[1])
+        prompts.append(data)
+        if len(prompts) == 1:
+            output = {"path": "README.md"}
+        else:
+            output = {"summary": "Read repository facts", "read_evidence": {
+                "path": "README.md", "tool_call_id": data["read"]["tool_call_id"]}}
+        return ModelReply(output, ModelTokenUsage(input_tokens=40, output_tokens=20))
+    @contextmanager
+    def gateways(session_factory, worker_id):
+        yield _scripted_gateways(session_factory, worker_id, supervisor=supervisor, explorer=explorer)
+    args = _cli_args(setup, tmp_path, extra=["--confirm-run", "--memory-id", str(selection.memory_id),
+        "--memory-sha256", selection.candidate_sha256, "--memory-use-key", str(selection.idempotency_key),
+        "--memory-environment", selection.target_environment])
+    assert worker_run_main(args, session_factory=factory, gateways_factory=gateways) == 0
+    event = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert event["claimed"] and event["attempt_kind"] == "rehearsal"
+    assert event["formal_acceptance"] == "not_performed"
+    assert prompts[0][MEMORY_RECALL_CONTEXT_KEY]["candidate_id"] == str(selection.memory_id)
+    run_id = _runs(factory, setup.task_id)[0].id
+    with factory() as session:
+        explorer_execution = session.scalar(select(AgentExecution).where(AgentExecution.run_id == run_id,
+            AgentExecution.agent_role == "explorer"))
+        assert explorer_execution.input[MEMORY_RECALL_CONTEXT_KEY]["content_status"] == "unverified_candidate"
+        uses = session.scalars(select(MemoryUse).where(MemoryUse.task_id == setup.task_id)).all()
+        assert len(uses) == 1 and uses[0].idempotency_key == selection.idempotency_key
+        repository = session.get(Task, setup.task_id).repo
+    another_task = _task(factory, repository, setup.base_commit)
+    next_request = replace(_request(setup, tmp_path, memory_recall=selection), task_id=another_task)
+    with pytest.raises(WorkerRunError, match="use key is already in use"):
+        prepare_worker_run(next_request, session_factory=factory)
+    assert _runs(factory, another_task) == []
+
+
+def test_cli_refuses_incomplete_memory_selection_before_claim(worker_session_factory, tmp_path, monkeypatch, capsys):
+    factory = worker_session_factory
+    setup = _setup(factory, tmp_path, monkeypatch)
+    args = _cli_args(setup, tmp_path, extra=["--confirm-run", "--memory-id", str(uuid4())])
+    assert worker_run_main(args, session_factory=factory, gateways_factory=_gateways) == 2
+    assert "memory selection arguments" in capsys.readouterr().err
+    assert _runs(factory, setup.task_id) == []
+
+
 def test_the_cli_runs_one_rehearsal_and_reports_where_it_stopped(
     worker_session_factory, tmp_path, monkeypatch, capsys,
 ):
@@ -731,3 +924,239 @@ def test_the_cli_reports_an_execution_failure_and_keeps_the_run(
     assert failure["error_type"] == "RuntimeError"
     assert failure["run_id"] == str(runs[0].id)
     assert runs[0].status is RunStatus.RUNNING
+
+
+def _pinned_manifest(tmp_path):
+    """A manifest over a few files of the package that is actually running."""
+    from devflow_ai.execution_binding import package_modules, running_package_root
+    from devflow_ai.execution_manifest import build_manifest, manifest_sha256
+
+    root = running_package_root()
+    # Complete on purpose: the entries refuse an inventory that leaves a module out.
+    manifest = build_manifest(root, package_modules(root))
+    path = tmp_path / "execution-manifest.json"
+    path.write_text(manifest.model_dump_json(), encoding="utf-8")
+    return path, manifest_sha256(manifest)
+
+
+def test_a_verified_execution_manifest_is_recorded_for_the_claim(
+        worker_session_factory, tmp_path, monkeypatch):
+    factory = worker_session_factory
+    setup = _setup(factory, tmp_path, monkeypatch)
+    manifest_path, digest = _pinned_manifest(tmp_path)
+
+    prepared = prepare_worker_run(
+        _request(setup, tmp_path, execution_manifest=manifest_path,
+                 execution_sha256=digest),
+        session_factory=factory)
+
+    assert prepared.execution_sha256 == digest
+    # Nothing is claimed at preparation time; the digest is what the claim will record.
+    assert _runs(factory, setup.task_id) == []
+
+
+def test_a_manifest_that_does_not_match_its_pin_is_refused_before_claim(
+        worker_session_factory, tmp_path, monkeypatch):
+    factory = worker_session_factory
+    setup = _setup(factory, tmp_path, monkeypatch)
+    manifest_path, _digest = _pinned_manifest(tmp_path)
+
+    with pytest.raises(WorkerRunError, match="Execution binding refused"):
+        prepare_worker_run(
+            _request(setup, tmp_path, execution_manifest=manifest_path,
+                     execution_sha256="f" * 64),
+            session_factory=factory)
+
+    assert _runs(factory, setup.task_id) == []
+
+
+def test_a_manifest_without_its_pin_is_refused_before_claim(
+        worker_session_factory, tmp_path, monkeypatch):
+    factory = worker_session_factory
+    setup = _setup(factory, tmp_path, monkeypatch)
+    manifest_path, digest = _pinned_manifest(tmp_path)
+
+    for overrides in ({"execution_manifest": manifest_path},
+                      {"execution_sha256": digest}):
+        with pytest.raises(WorkerRunError, match="must be supplied together"):
+            prepare_worker_run(_request(setup, tmp_path, **overrides),
+                               session_factory=factory)
+
+    assert _runs(factory, setup.task_id) == []
+
+
+def test_a_claim_records_the_verified_execution_version(
+        worker_session_factory, tmp_path, monkeypatch):
+    factory = worker_session_factory
+    setup = _setup(factory, tmp_path, monkeypatch)
+    manifest_path, digest = _pinned_manifest(tmp_path)
+    worker = Worker(factory, "worker-run-entry")
+    with _gateways(factory, worker.worker_id, output=BLOCKED_DECISION) as gateways:
+        result = run_worker_once(
+            _request(setup, tmp_path, execution_manifest=manifest_path,
+                     execution_sha256=digest),
+            session_factory=factory, worker=worker, gateways=gateways,
+            heartbeat_config=HEARTBEAT)
+
+    assert result["claimed"] is True
+    assert result["execution_sha256"] == digest
+    # The Run carries the version decision made before the claim, not one added later.
+    assert [run.execution_sha256 for run in _runs(factory, setup.task_id)] == [digest]
+
+
+def test_the_cli_refuses_a_manifest_that_does_not_match_its_pin(
+        worker_session_factory, tmp_path, monkeypatch, capsys):
+    factory = worker_session_factory
+    setup = _setup(factory, tmp_path, monkeypatch)
+    manifest_path, _digest = _pinned_manifest(tmp_path)
+
+    exit_code = worker_run_main(
+        _cli_args(setup, tmp_path, extra=[
+            "--confirm-run", "--execution-manifest", str(manifest_path),
+            "--execution-sha256", "f" * 64]),
+        session_factory=factory, gateways_factory=_gateways)
+
+    assert exit_code == 2
+    # The operator sees why, and nothing was claimed: no Run exists to clean up.
+    assert "Execution binding refused" in capsys.readouterr().err
+    assert _runs(factory, setup.task_id) == []
+
+
+def test_recovery_verifies_the_pinned_manifest_before_creating_a_retry(
+        worker_session_factory, tmp_path, monkeypatch):
+    from devflow_ai.execution_binding import ExecutionBindingError
+
+    factory = worker_session_factory
+    setup = _setup(factory, tmp_path, monkeypatch)
+    manifest_path, digest = _pinned_manifest(tmp_path)
+    for name in ("workspaces", "artifacts"):
+        (tmp_path / name).mkdir(exist_ok=True)
+    worker = Worker(factory, "recovery-worker")
+    common = dict(
+        creation_idempotency_key="retry-1", workspaces_root=tmp_path / "workspaces",
+        artifacts_root=tmp_path / "artifacts", supervisor_gateway=None,
+        explorer_gateway=None, planner_gateway=None, max_read_bytes=1024,
+        stop_event=Event())
+
+    # The mismatch is caught before any Task or Run is touched, so the stubbed gateways are
+    # never used and no Run is created.
+    with pytest.raises(ExecutionBindingError, match="pinned digest"):
+        worker.resume_implementation_recovery(
+            setup.task_id, execution_manifest=manifest_path,
+            execution_sha256="f" * 64, **common)
+    with pytest.raises(ExecutionBindingError, match="must be supplied together"):
+        worker.resume_implementation_recovery(
+            setup.task_id, execution_manifest=manifest_path, **common)
+    assert _runs(factory, setup.task_id) == []
+
+    # With the manifest verified, recovery of a Task that is not in a recoverable state is
+    # still refused, and nothing is created: the entry never turns a manifest into permission.
+    from devflow_ai.coordinator import RunCoordinator
+
+    with factory() as session:
+        run, _ = RunCoordinator(session).start_initial_run(
+            setup.task_id, "recovery-worker", "initial", execution_sha256="9" * 64)
+        run_id = run.id
+    with pytest.raises(ValueError):
+        worker.resume_implementation_recovery(
+            setup.task_id, execution_manifest=manifest_path,
+            execution_sha256=digest, **common)
+    assert [run.id for run in _runs(factory, setup.task_id)] == [run_id]
+    with factory() as session:
+        assert session.get(Run, run_id).execution_sha256 == "9" * 64
+
+
+def test_a_replay_is_only_reported_under_the_version_it_ran(
+        worker_session_factory, tmp_path, monkeypatch):
+    from devflow_ai.coordinator import RunCoordinator
+
+    factory = worker_session_factory
+    setup = _setup(factory, tmp_path, monkeypatch)
+    manifest_path, digest = _pinned_manifest(tmp_path)
+    # The Run this Task already owns was started from another deployment's inventory. Today's
+    # package hashes to a different digest, so this call's verified version is not that one.
+    previous_digest = "0" * 64
+    with factory() as session:
+        RunCoordinator(session).start_initial_run(
+            setup.task_id, "recovery-worker", f"worker:{setup.task_id}:1",
+            execution_sha256=previous_digest)
+    assert previous_digest != digest
+
+    with pytest.raises(WorkerRunError, match="already exists under a different execution"):
+        prepare_worker_run(
+            _request(setup, tmp_path, execution_manifest=manifest_path,
+                     execution_sha256=digest),
+            session_factory=factory)
+
+    # An unpinned call cannot adopt that Run either: it verified nothing.
+    with pytest.raises(WorkerRunError, match="already exists under a different execution"):
+        prepare_worker_run(_request(setup, tmp_path), session_factory=factory)
+
+
+def test_execute_run_verifies_the_execution_version_before_any_work(
+        worker_session_factory, tmp_path, monkeypatch):
+    from devflow_ai.coordinator import RunCoordinator, RunVersionConflictError
+    from devflow_ai.execution_binding import ExecutionBindingError
+
+    factory = worker_session_factory
+    setup = _setup(factory, tmp_path, monkeypatch)
+    manifest_path, digest = _pinned_manifest(tmp_path)
+    workspaces, artifacts = tmp_path / "exec-ws", tmp_path / "exec-ar"
+    workspaces.mkdir()
+    artifacts.mkdir()
+    worker = Worker(factory, "exec-worker")
+    with factory() as session:
+        run, _ = RunCoordinator(session).start_initial_run(
+            setup.task_id, "exec-worker", "exec-key", execution_sha256=digest)
+        run_id = run.id
+
+    calls = []
+
+    def process(directories, commit, stop):
+        calls.append(commit)
+        return "ran"
+
+    common = dict(workspaces_root=workspaces, artifacts_root=artifacts,
+                  heartbeat_config=HEARTBEAT, process_run=process)
+    # A pinned Run is not executable on trust: no manifest means nothing was re-verified.
+    with pytest.raises(RunVersionConflictError, match="different execution version"):
+        worker.execute_run(run_id, **common)
+    # A manifest that disagrees with its own pin is refused by the binding first.
+    with pytest.raises(ExecutionBindingError):
+        worker.execute_run(run_id, **common, execution_manifest=manifest_path,
+                           execution_sha256="f" * 64)
+    # Neither refusal touched the workspace or ran a stage.
+    assert calls == []
+    assert list(workspaces.iterdir()) == []
+
+    assert worker.execute_run(run_id, **common, execution_manifest=manifest_path,
+                              execution_sha256=digest) == "ran"
+    assert len(calls) == 1
+
+
+def test_execute_run_keeps_the_unpinned_v1_path_working(
+        worker_session_factory, tmp_path, monkeypatch):
+    from devflow_ai.coordinator import RunCoordinator
+
+    factory = worker_session_factory
+    setup = _setup(factory, tmp_path, monkeypatch)
+    workspaces, artifacts = tmp_path / "v1-ws", tmp_path / "v1-ar"
+    workspaces.mkdir()
+    artifacts.mkdir()
+    worker = Worker(factory, "v1-worker")
+    with factory() as session:
+        run, _ = RunCoordinator(session).start_initial_run(
+            setup.task_id, "v1-worker", "v1-key")
+        run_id = run.id
+
+    calls = []
+    result = worker.execute_run(
+        run_id, workspaces_root=workspaces, artifacts_root=artifacts,
+        heartbeat_config=HEARTBEAT,
+        process_run=lambda directories, commit, stop: calls.append(commit) or "ran")
+
+    # A Run claimed without a pinned manifest stays executable, and executing it under no
+    # manifest does not invent a version for it.
+    assert result == "ran" and len(calls) == 1
+    with factory() as session:
+        assert session.get(Run, run_id).execution_sha256 is None

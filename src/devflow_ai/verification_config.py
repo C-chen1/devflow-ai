@@ -7,6 +7,7 @@ from pathlib import Path, PureWindowsPath
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
+from devflow_ai.task_pack import ScopeSpec
 
 NonBlank = Annotated[str, StringConstraints(min_length=1)]
 
@@ -36,6 +37,8 @@ class VerificationConfig(BaseModel):
     public_tests_root: NonBlank | None = None
     external_connections: Literal["unknown", "none", "required"] = "unknown"
     independent_suite_version: NonBlank | None = None
+    # Trusted task-pack scope for optional diagnostic Skill; not a formal pass condition.
+    scope: ScopeSpec | None = None
 
     @field_validator("command_name", "pythonpath_relative", "independent_suite_version",
                      "public_tests_root", "python_executable")

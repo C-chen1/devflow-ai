@@ -180,6 +180,7 @@ def test_the_manifest_builds_the_verification_config_a_run_needs():
     assert config.pythonpath_relative == "src"
     assert config.external_connections == "none"
     assert config.independent_suite_version == "suite-1"
+    assert config.scope == manifest.scope
 
 
 def test_no_suite_version_is_invented_when_the_pack_has_none():

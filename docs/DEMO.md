@@ -2,6 +2,32 @@
 
 本演示验证 API 接收任务、持久化、幂等提交和查询；**不会启动 Agent 或调用模型**，也不代表真实修复或正式验收通过。示例会在 API 当前连接的数据库中创建一条 Task，请使用已迁移至项目 head 的专用演示数据库，不要使用业务数据。
 
+## 四项能力的隔离测试演示
+
+在项目根目录、确认 `.env.test` 指向专用 `devflow_test` 且 PostgreSQL 可用后，可运行以下测试，查看四项能力的当前闭环：
+
+```powershell
+uv run --env-file .env.test --locked --no-sync python -m pytest `
+  tests/test_memory.py::test_operator_can_preview_review_prepare_and_trace_recall `
+  tests/test_memory.py::test_explicit_recall_reaches_explorer_but_disables_independent_evaluation `
+  tests/test_worker_integration.py::test_registered_skill_reuses_same_version_across_isolated_tasks `
+  tests/test_experiment.py::test_a_registered_record_is_traced_to_its_registration `
+  tests/test_experiment.py::test_a_promotable_pass_without_a_registered_record_cannot_be_promoted `
+  -q -p no:cacheprovider
+```
+
+这五项分别覆盖记忆准备与追溯、显式召回及独立评测限制、Skill 在隔离任务中的复用与权限、实验记录登记及未登记的拒绝条件。它们使用构造数据、隔离 schema 和模型桩，不调用真实模型，不代表真实任务成功、召回有效或 RSI 已运行。数据库测试需要具备创建和删除自身隔离 schema 的权限；不要指向案例数据库。
+
+如需展示实验账目与阶段驱动的完整构造流程，可另行运行：
+
+```powershell
+uv run --env-file .env.test --locked --no-sync python -m pytest tests/test_rsi_demo_flow.py -s
+```
+
+该演示使用独立临时 PostgreSQL（需要 pgserver，或已运行 Docker 且本地已有 `postgres:17.11` 镜像）、两个测试角色和模型桩；不调用真实模型。它包含单进程与双进程构造场景，版本摘要和工作区由测试构造，测试直接结束构造 Run；不是实际部署回退、正式验收或真实 RSI 改进实验。详情见 [RSI 演示说明](RSI_READINESS.md#手动触发的构造实验演示2026-11-19)。
+
+如需准备真实开发演练，见 [显式记忆开发演练](DEPLOYMENT.md#显式记忆开发演练)；该操作需要先确定任务、预算和证据范围。受控 RSI 的 `accepted` 和自动循环仍未开放，见 [启动核对](RSI_READINESS.md)。
+
 ## 准备
 
 依照 [README](../README.md) 启动数据库，检查数据库指向和迁移版本，再启动 API。下面的请求假定 API 地址是 `http://127.0.0.1:8000`。

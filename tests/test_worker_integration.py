@@ -28,6 +28,7 @@ import devflow_ai.harness as harness_module
 import devflow_ai.worker as worker_module
 from devflow_ai.artifacts import ToolArtifactResult, write_artifact_file
 from devflow_ai.admission_dispatch import dispatch_one_admission
+from devflow_ai.benchmark_task import create_benchmark_task
 from devflow_ai.config import HeartbeatConfig, LeaseConfig
 from devflow_ai.context import AgentReadEvidenceError, ContextBuilder, ReadEvidenceRef, VerifierPatchEvidenceError
 from devflow_ai.coordinator import (
@@ -46,6 +47,8 @@ from devflow_ai.model_gateway import AdmissionModelGateway, ModelGateway, ModelR
 from devflow_ai.repositories import ToolCallRepository
 from devflow_ai.policy import build_default_policy
 from devflow_ai.runtime_environment import observe_current_python_environment
+from devflow_ai.skills import REGISTERED_CHECK, SkillNotApplicable, check_diff_scope, run_registered_check, supports_diff_scope
+from devflow_ai.task_pack import ScopeSpec, load_manifest, scope_evidence_sha256
 from devflow_ai.services import TaskService, TaskStateConflictError
 from devflow_ai.worker import (
     ExplorerResult, PlannerContextUnavailableError, PlannerModelBudgetUnavailableError,
@@ -3605,6 +3608,9 @@ def test_baseline_verifier_records_failing_test_before_patch(worker_audit_sessio
         directories=RunDirectories(workspace, artifacts), command_name="pytest",
         registry={"pytest": (sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_baseline.py")},
         stop_event=Event())
+    with factory() as session:
+        call = session.get(ToolCall, UUID(result["receipt"]["tool_call_id"]))
+        assert call.args["skill"] == {"name": "run_registered_check", "version": "2", "pytest_capture": True}
     if tamper_report:
         assert result["valid"] is False
         with factory() as session:
@@ -3669,6 +3675,201 @@ def test_verification_migration_roundtrip_and_persistence(worker_audit_session_f
         saved = observer.get(Verification, verification_id)
         assert saved.run_id == run_id and saved.result == VerificationResult.FAILED
         assert saved.evidence["test"]["exit_code"] == 1
+
+
+@pytest.mark.parametrize("allow,role,exit_value,expected", [
+    (True, AgentRole.VERIFIER, 0, "succeeded"),
+    (True, AgentRole.VERIFIER, 7, "failed"),
+    (False, AgentRole.VERIFIER, 0, "denied"),
+    (True, AgentRole.CODER, 0, "denied"),
+])
+def test_registered_check_skill_respects_existing_tool_boundary(
+    worker_audit_session_factory, tmp_path, allow, role, exit_value, expected,
+):
+    factory = worker_audit_session_factory
+    worker = Worker(factory, f"skill-{uuid4().hex[:8]}")
+    task_id = create_eligible_task(factory)
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        snapshot = task.policy_snapshot
+        task.policy_snapshot = {**snapshot, "permissions": {"allowed_tools_by_role": {
+            **snapshot["permissions"]["allowed_tools_by_role"],
+            "VERIFIER": ["run_command"] if allow else [], "CODER": ["run_command"]}}}
+    run_id = worker.claim_once().run_id
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    with factory() as session:
+        execution_id = RunCoordinator(session).start_agent_execution(
+            run_id, worker.worker_id, role=role, agent_input={})
+    registry = {"check": (sys.executable, "-c", f"import sys; sys.exit({exit_value})")}
+    if role is AgentRole.CODER:
+        with pytest.raises(SkillNotApplicable, match="not a Verifier"):
+            run_registered_check(version="1", worker=worker, run_id=run_id,
+                verifier_execution_id=execution_id, directories=RunDirectories(tmp_path, artifact_root),
+                registry=registry, command_name="check", stop_event=Event())
+        with factory() as session:
+            assert session.scalar(select(func.count()).select_from(ToolCall).where(
+                ToolCall.agent_execution_id == execution_id)) == 0
+        return
+    result = run_registered_check(version="1", worker=worker, run_id=run_id,
+        verifier_execution_id=execution_id, directories=RunDirectories(tmp_path, artifact_root),
+        registry=registry, command_name="check", stop_event=Event())
+    assert result["skill"] == REGISTERED_CHECK.name and result["version"] == "1"
+    assert result["tool_status"] == expected
+    with factory() as session:
+        call = session.get(ToolCall, UUID(result["tool_call_id"]))
+        assert call.run_id == run_id and call.agent_execution_id == execution_id
+        assert call.tool_name == "run_command" and call.status.value == expected
+        assert call.args["command_name"] == "check"
+        assert call.args["skill"] == {"name": "run_registered_check", "version": "1", "pytest_capture": False}
+    with pytest.raises(SkillNotApplicable):
+        run_registered_check(version="1", worker=worker, run_id=run_id, verifier_execution_id=execution_id,
+            directories=RunDirectories(tmp_path, artifact_root), registry=registry,
+            command_name="unregistered", stop_event=Event())
+    with pytest.raises(SkillNotApplicable):
+        run_registered_check(version="3", worker=worker, run_id=run_id, verifier_execution_id=execution_id,
+            directories=RunDirectories(tmp_path, artifact_root), registry=registry,
+            command_name="check", stop_event=Event())
+    with pytest.raises(SkillNotApplicable):
+        run_registered_check(version="1", worker=worker, run_id=run_id, verifier_execution_id=execution_id,
+            directories=RunDirectories(tmp_path, artifact_root), registry=registry,
+            command_name="check", stop_event=Event(), trusted_pytest_capture=True)
+
+
+def test_scope_skill_supports_literal_rules_but_not_wildcards():
+    assert supports_diff_scope(ScopeSpec(allowed_paths=("src/", "README.md")), 4096)
+    assert not supports_diff_scope(ScopeSpec(allowed_paths=("*.py",)), 4096)
+    assert not supports_diff_scope(ScopeSpec(allowed_paths=("src/",)), 6 * 1024 * 1024)
+
+
+def test_registered_skill_reuses_same_version_across_isolated_tasks(worker_audit_session_factory, tmp_path):
+    factory = worker_audit_session_factory
+    attempts = []
+    for name, allowed in (("first", True), ("second", True), ("denied", False)):
+        worker = Worker(factory, f"skill-{name}-{uuid4().hex[:8]}")
+        task_id = create_eligible_task(factory, repo=f"fixture-{name}")
+        with factory.begin() as session:
+            task = session.get(Task, task_id)
+            snapshot = task.policy_snapshot
+            task.policy_snapshot = {**snapshot, "permissions": {"allowed_tools_by_role": {
+                **snapshot["permissions"]["allowed_tools_by_role"],
+                "VERIFIER": ["run_command"] if allowed else []}}}
+        run_id = worker.claim_once().run_id
+        workspace = tmp_path / name
+        workspace.mkdir()
+        artifacts = tmp_path / f"{name}-artifacts"
+        artifacts.mkdir()
+        with factory() as session:
+            execution_id = RunCoordinator(session).start_agent_execution(
+                run_id, worker.worker_id, role=AgentRole.VERIFIER, agent_input={})
+        registry = {"check": (sys.executable, "-c", f"print('{name}')")}
+        result = run_registered_check(version="2", worker=worker, run_id=run_id,
+            verifier_execution_id=execution_id, directories=RunDirectories(workspace, artifacts),
+            registry=registry, command_name="check", stop_event=Event())
+        assert result["tool_status"] == ("succeeded" if allowed else "denied")
+        with factory() as session:
+            call = session.get(ToolCall, UUID(result["tool_call_id"]))
+            assert call.run_id == run_id and call.agent_execution_id == execution_id
+            assert call.args["skill"]["name"] == "run_registered_check"
+            assert call.args["skill"]["version"] == "2"
+            assert session.get(Run, run_id).task_id == task_id
+        attempts.append((worker, run_id, execution_id, workspace, artifacts, registry, result))
+    assert len({entry[1] for entry in attempts}) == 3
+    assert attempts[0][-1]["command_sha256"] != attempts[1][-1]["command_sha256"]
+    first, second = attempts[:2]
+    with pytest.raises(SkillNotApplicable, match="not a Verifier"):
+        run_registered_check(version="2", worker=first[0], run_id=first[1],
+            verifier_execution_id=second[2], directories=RunDirectories(first[3], first[4]),
+            registry=first[5], command_name="check", stop_event=Event())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Report capture requires a managed Windows Job")
+@pytest.mark.parametrize("assertion,expected_status,expected_case", [
+    ("True", "succeeded", "passed"), ("False", "failed", "failed"),
+])
+def test_registered_check_v2_captures_bound_pytest_report(
+    worker_audit_session_factory, tmp_path, monkeypatch, assertion, expected_status, expected_case,
+):
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    factory = worker_audit_session_factory
+    worker = Worker(factory, f"skill-report-{uuid4().hex[:8]}")
+    task_id = create_eligible_task(factory)
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        snapshot = task.policy_snapshot
+        task.policy_snapshot = {**snapshot, "budget": {**snapshot["budget"], "tool_call_timeout_seconds": 20},
+            "permissions": {"allowed_tools_by_role": {**snapshot["permissions"]["allowed_tools_by_role"],
+                                                        "VERIFIER": ["run_command"]}}}
+    run_id = worker.claim_once().run_id
+    workspace, artifacts = tmp_path / "workspace", tmp_path / "artifacts"
+    workspace.mkdir()
+    artifacts.mkdir()
+    (workspace / "test_example.py").write_text(f"def test_example(): assert {assertion}\n", encoding="utf-8")
+    with factory() as session:
+        verifier_id = RunCoordinator(session).start_agent_execution(
+            run_id, worker.worker_id, role=AgentRole.VERIFIER, agent_input={})
+    registry = {"pytest": (sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_example.py")}
+    result = run_registered_check(version="2", worker=worker, run_id=run_id,
+        verifier_execution_id=verifier_id, directories=RunDirectories(workspace, artifacts), registry=registry,
+        command_name="pytest", stop_event=Event(), trusted_pytest_capture=True)
+    assert result["tool_status"] == expected_status and result["version"] == "2"
+    assert len(result["command_sha256"]) == 64
+    junit = next(artifact for artifact in result["artifacts"] if artifact["kind"] == "pytest_junit")
+    with factory() as session:
+        report = load_pytest_report_artifact(session, run_id, verifier_id,
+            tool_call_id=UUID(result["tool_call_id"]), artifact_id=UUID(junit["id"]),
+            artifact_root=artifacts, expected_command_name="pytest")
+        assert report.tests[0].status == expected_case
+        assert session.get(Run, run_id).status is RunStatus.RUNNING
+        call = session.get(ToolCall, UUID(result["tool_call_id"]))
+        assert call.args["skill"] == {"name": "run_registered_check", "version": "2", "pytest_capture": True}
+        assert call.args["command_sha256"] == result["command_sha256"]
+    missing = run_registered_check(version="2", worker=worker, run_id=run_id,
+        verifier_execution_id=verifier_id, directories=RunDirectories(workspace, artifacts),
+        registry={"missing": (sys.executable, "-c", "print('no report')")},
+        command_name="missing", stop_event=Event(), trusted_pytest_capture=True)
+    assert missing["reason"] == "PYTEST_REPORT_MISSING_OR_INVALID"
+    assert not any(artifact["kind"] == "pytest_junit" for artifact in missing["artifacts"])
+
+
+def test_skill_identity_is_committed_before_command_failure(worker_audit_session_factory, tmp_path, monkeypatch):
+    factory = worker_audit_session_factory
+    worker = Worker(factory, f"skill-audit-{uuid4().hex[:8]}")
+    task_id = create_eligible_task(factory)
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        snapshot = task.policy_snapshot
+        task.policy_snapshot = {**snapshot, "permissions": {"allowed_tools_by_role": {
+            **snapshot["permissions"]["allowed_tools_by_role"], "VERIFIER": ["run_command"]}}}
+    run_id = worker.claim_once().run_id
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    with factory() as session:
+        execution_id = RunCoordinator(session).start_agent_execution(
+            run_id, worker.worker_id, role=AgentRole.VERIFIER, agent_input={})
+    with factory() as session:
+        with pytest.raises(ValueError, match="Unsupported registered-check"):
+            RunCoordinator(session).execute_verifier_command(run_id, worker.worker_id,
+                agent_execution_id=execution_id, workspace_root=tmp_path, artifact_root=artifacts,
+                command_name="check", registry={"check": (sys.executable, "-c", "pass")},
+                stop_event=Event(), registered_check_skill_version="999")
+        assert session.scalar(select(func.count()).select_from(ToolCall).where(
+            ToolCall.agent_execution_id == execution_id)) == 0
+    observed = []
+    def fail_after_observing_request(*args, **kwargs):
+        with factory() as observer:
+            call = observer.scalar(select(ToolCall).where(ToolCall.agent_execution_id == execution_id))
+            observed.append((call.id, call.args["skill"]))
+        raise RuntimeError("simulated uncertain result")
+    monkeypatch.setattr(coordinator_module, "run_registered_command", fail_after_observing_request)
+    with pytest.raises(RuntimeError, match="simulated uncertain result"):
+        run_registered_check(version="2", worker=worker, run_id=run_id,
+            verifier_execution_id=execution_id, directories=RunDirectories(tmp_path, artifacts),
+            registry={"check": (sys.executable, "-c", "pass")}, command_name="check", stop_event=Event())
+    assert observed[0][1] == {"name": "run_registered_check", "version": "2", "pytest_capture": False}
+    with factory() as session:
+        call = session.get(ToolCall, observed[0][0])
+        assert call.status is ToolCallStatus.UNKNOWN_RESULT
 
 
 def test_verifier_registered_commands_are_audited(worker_audit_session_factory, tmp_path):
@@ -4068,6 +4269,160 @@ def test_pytest_report_reference_must_match_committed_call_and_hash(worker_audit
         path.write_bytes(report + b" ")
         with pytest.raises(VerificationEvidenceError, match="verified"):
             load(failed_call)
+
+
+@pytest.mark.parametrize("allow_tool", [True, False])
+def test_diff_scope_skill_uses_guarded_diff_and_literal_rules(worker_audit_session_factory, tmp_path, allow_tool):
+    workspace, artifact_root = tmp_path / "workspace", tmp_path / "artifacts"
+    workspace.mkdir()
+    artifact_root.mkdir()
+    (workspace / "src" / "private").mkdir(parents=True)
+    paths = ("src/public.py", "src/private/secret.py", "outside.py", "src2.py")
+    for path in paths:
+        (workspace / path).write_text("value = 1\n", encoding="utf-8")
+    def git(*args):
+        return subprocess.run(["git", "-C", str(workspace), *args], check=True,
+                              capture_output=True, text=True, encoding="utf-8").stdout
+    git("init", "-q")
+    git("add", *paths)
+    git("-c", "user.name=DevFlow Test", "-c", "user.email=devflow@example.invalid", "commit", "-qm", "baseline")
+    base = git("rev-parse", "HEAD").strip()
+    for path in paths:
+        (workspace / path).write_text("value = 2\n", encoding="utf-8")
+    factory = worker_audit_session_factory
+    worker = Worker(factory, f"scope-skill-{uuid4().hex[:8]}")
+    task_id = create_eligible_task(factory, base_commit=base)
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        snapshot = task.policy_snapshot
+        task.policy_snapshot = {**snapshot, "permissions": {"allowed_tools_by_role": {
+            **snapshot["permissions"]["allowed_tools_by_role"], "VERIFIER": ["git_diff"] if allow_tool else []}}}
+    run_id = worker.claim_once().run_id
+    with factory() as session:
+        execution_id = RunCoordinator(session).start_agent_execution(run_id, worker.worker_id,
+            role=AgentRole.VERIFIER, agent_input={})
+    with factory() as session:
+        coder_id = RunCoordinator(session).start_agent_execution(run_id, worker.worker_id,
+            role=AgentRole.CODER, agent_input={})
+    kwargs = dict(version="1", worker=worker, run_id=run_id, verifier_execution_id=execution_id,
+                  directories=RunDirectories(workspace, artifact_root), max_diff_bytes=65536, stop_event=Event())
+    for rule in ("../", "/root", "src/*", "src/../private", "src\\private"):
+        with pytest.raises(SkillNotApplicable):
+            check_diff_scope(**kwargs, trusted_scope=ScopeSpec(allowed_paths=(rule,)))
+    scope = ScopeSpec(allowed_paths=("src/",), forbidden_paths=("src/private/",))
+    with pytest.raises(SkillNotApplicable, match="does not pin"):
+        check_diff_scope(**{**kwargs, "version": "2"}, trusted_scope=scope)
+    with pytest.raises(SkillNotApplicable, match="not a Verifier"):
+        check_diff_scope(**{**kwargs, "verifier_execution_id": coder_id}, trusted_scope=scope)
+    if not allow_tool:
+        with pytest.raises(VerificationEvidenceError):
+            check_diff_scope(**kwargs, trusted_scope=scope)
+        with factory() as session:
+            call = session.scalar(select(ToolCall).where(ToolCall.agent_execution_id == execution_id))
+            assert call.status is ToolCallStatus.DENIED
+        return
+    result = check_diff_scope(**kwargs, trusted_scope=scope)
+    assert result["result"] == "outside_declared_scope"
+    assert {v["path"]: v["reason"] for v in result["violations"]} == {
+        "src/private/secret.py": "forbidden", "outside.py": "not_allowed", "src2.py": "not_allowed"}
+    with factory() as session:
+        call = session.get(ToolCall, UUID(result["tool_call_id"]))
+        assert call.tool_name == "git_diff" and call.status is ToolCallStatus.SUCCEEDED
+        assert session.get(Artifact, UUID(result["numstat_artifact_id"])).tool_call_id == call.id
+        assert call.args["skill"] == {"name": "check_diff_scope", "version": "1",
+                                      "scope_sha256": result["scope_sha256"]}
+    clean_scope = ScopeSpec(allowed_paths=("src/", "outside.py", "src2.py"))
+    assert check_diff_scope(**kwargs, trusted_scope=clean_scope)["result"] == "within_declared_scope"
+    with factory.begin() as session:
+        call = session.get(ToolCall, UUID(result["tool_call_id"]))
+        call.args = {**call.args, "skill": {**call.args["skill"], "version": "unknown"}}
+    from devflow_ai.verifier import load_verifier_workspace_diff
+    with factory() as session:
+        with pytest.raises(VerificationEvidenceError):
+            load_verifier_workspace_diff(session, run_id, execution_id, tool_call_id=UUID(result["tool_call_id"]),
+                                         artifact_root=artifact_root, max_bytes=65536)
+    (workspace / "untracked.txt").write_text("not covered", encoding="utf-8")
+    with pytest.raises(VerificationEvidenceError):
+        check_diff_scope(**kwargs, trusted_scope=scope)
+
+
+def test_diff_scope_v2_requires_admission_binding_and_rechecks_before_tool(
+    worker_audit_session_factory, tmp_path, monkeypatch,
+):
+    workspace, artifact_root = tmp_path / "workspace", tmp_path / "artifacts"
+    workspace.mkdir()
+    artifact_root.mkdir()
+    (workspace / "src").mkdir()
+    (workspace / "src" / "file.py").write_text("x = 1\n", encoding="utf-8")
+    (workspace / "src" / "[file].py").write_text("x = 1\n", encoding="utf-8")
+    def git(*args):
+        return subprocess.run(["git", "-C", str(workspace), *args], check=True,
+                              capture_output=True, text=True, encoding="utf-8").stdout
+    git("init", "-q")
+    git("add", "src")
+    git("-c", "user.name=DevFlow Test", "-c", "user.email=devflow@example.invalid", "commit", "-qm", "baseline")
+    base = git("rev-parse", "HEAD").strip()
+    (workspace / "src" / "file.py").write_text("x = 2\n", encoding="utf-8")
+    scope = ScopeSpec(allowed_paths=("src/",))
+    manifest = load_manifest(Path(__file__).resolve().parents[1] / "benchmarks" / "click_3019_public")
+    manifest = manifest.model_copy(update={"base_commit": base, "scope": scope})
+    policy = build_default_policy()
+    policy.permissions.allowed_tools_by_role[AgentRole.VERIFIER] = ["git_diff"]
+    factory = worker_audit_session_factory
+    task_id = create_benchmark_task(factory, manifest, repo="example-repo", policy=policy, operator="test")
+    worker = Worker(factory, f"scope-bound-{uuid4().hex[:8]}")
+    run_id = worker.claim_once().run_id
+    with factory() as session:
+        execution_id = RunCoordinator(session).start_agent_execution(run_id, worker.worker_id,
+            role=AgentRole.VERIFIER, agent_input={})
+    kwargs = dict(version="2", worker=worker, run_id=run_id, verifier_execution_id=execution_id,
+                  directories=RunDirectories(workspace, artifact_root), max_diff_bytes=65536, stop_event=Event())
+    with pytest.raises(SkillNotApplicable, match="does not pin"):
+        check_diff_scope(**kwargs, trusted_scope=ScopeSpec(allowed_paths=("elsewhere/",)))
+    result = check_diff_scope(**kwargs, trusted_scope=scope)
+    assert result["result"] == "within_declared_scope"
+    assert result["scope_sha256"] == scope_evidence_sha256(scope)
+    (workspace / "src" / "[file].py").write_text("x = 2\n", encoding="utf-8")
+    unusual = check_diff_scope(**kwargs, trusted_scope=scope)
+    assert unusual["result"] == "outside_declared_scope"
+    assert {v["path"]: v["reason"] for v in unusual["violations"]} == {
+        "src/[file].py": "unsupported_path"}
+    (workspace / "src" / "[file].py").write_text("x = 1\n", encoding="utf-8")
+    with factory() as session:
+        call = session.get(ToolCall, UUID(result["tool_call_id"]))
+        assert call.args["skill"]["version"] == "2"
+    original_builder = worker.build_verifier_diff
+    def changed_binding(*args, **kw):
+        callback = original_builder(*args, **kw)
+        def invoke():
+            with factory.begin() as session:
+                task = session.get(Task, task_id)
+                task.admission_record = {"reason": "changed", "evidence": ["pack:changed"]}
+            return callback()
+        return invoke
+    monkeypatch.setattr(worker, "build_verifier_diff", changed_binding)
+    with pytest.raises(VerificationEvidenceError):
+        check_diff_scope(**kwargs, trusted_scope=scope)
+    with factory() as session:
+        calls = session.scalars(select(ToolCall).where(ToolCall.agent_execution_id == execution_id)
+                                .order_by(ToolCall.created_at)).all()
+        assert calls[-1].status is ToolCallStatus.DENIED
+        assert calls[-1].reason == "TASK_SCOPE_BINDING_MISSING_OR_CHANGED"
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        task.admission_record = {"reason": "fixture restore", "evidence": [f"pack:{manifest.pack_id}",
+            f"scope-sha256-v1:{scope_evidence_sha256(scope)}"]}
+    def changed_after_tool(*args, **kw):
+        callback = original_builder(*args, **kw)
+        def invoke():
+            evidence = callback()
+            with factory.begin() as session:
+                session.get(Task, task_id).admission_record = {"reason": "changed", "evidence": ["pack:changed"]}
+            return evidence
+        return invoke
+    monkeypatch.setattr(worker, "build_verifier_diff", changed_after_tool)
+    with pytest.raises(SkillNotApplicable, match="changed during inspection"):
+        check_diff_scope(**kwargs, trusted_scope=scope)
 
 
 def test_verifier_reads_actual_git_diff_and_rejects_untracked_files(worker_audit_session_factory, tmp_path):

@@ -610,7 +610,14 @@ def load_verifier_workspace_diff(
         AgentExecution.run_id == run_id, AgentExecution.agent_role == AgentRole.VERIFIER.value.lower(),
     ))
     base = session.scalar(select(Task.base_commit).join(Run, Run.task_id == Task.id).where(Run.id == run_id))
-    if call is None or not base or call.args != {"base_commit": base}:
+    args = call.args if call is not None else None
+    valid_args = args == {"base_commit": base}
+    if isinstance(args, dict) and set(args) == {"base_commit", "skill"} and args.get("base_commit") == base:
+        skill = args["skill"]
+        valid_args = (isinstance(skill, dict) and set(skill) == {"name", "version", "scope_sha256"}
+            and skill.get("name") == "check_diff_scope" and skill.get("version") in ("1", "2")
+            and isinstance(skill.get("scope_sha256"), str) and fullmatch(r"[0-9a-f]{64}", skill["scope_sha256"]) is not None)
+    if call is None or not base or not valid_args:
         raise VerificationEvidenceError("Workspace diff does not match the Run and pinned base")
     artifacts = session.scalars(select(Artifact).where(
         Artifact.tool_call_id == tool_call_id, Artifact.agent_execution_id == verifier_execution_id,

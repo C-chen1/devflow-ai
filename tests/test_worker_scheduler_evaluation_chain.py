@@ -29,10 +29,11 @@ from devflow_ai.config import HeartbeatConfig
 from devflow_ai.coordinator import ModelTokenUsage
 from devflow_ai.enums import AgentExecutionStatus, AgentRole, RunStatus, TaskStatus, VerificationResult
 from devflow_ai.model_gateway import ModelGateway, ModelReply, PlannerModelGateway
-from devflow_ai.models import AgentExecution, Run, Task, Verification
+from devflow_ai.models import AgentExecution, Run, Task, ToolCall, Verification
 from devflow_ai.orchestration import run_handoff_cycle
 from devflow_ai.policy import build_default_policy
 from devflow_ai.services import AdmissionRecord, TaskService
+from devflow_ai.task_pack import ScopeSpec, scope_evidence_sha256
 from devflow_ai.worker_run import WorkerRunExecutionError, run_worker_once
 from devflow_ai.worker_scheduler import SchedulerRequest, run_scheduler
 
@@ -134,7 +135,7 @@ def _pack(tmp_path, base_commit, material):
         "issue": {"sanitized_problem": "The answer is stale.",
                   "observable_error": "answer.txt still holds the old value.",
                   "expected_behavior": "answer.txt holds the new value."},
-        "scope": {"allowed_paths": ["answer.txt", "notes.txt"]},
+        "scope": {"allowed_paths": ["answer.txt"]},
         "public_checks": {"command": ["python", "-m", "pytest", "scenarios.py"], "command_name": "pytest",
                           "target_tests": ["scenarios::test_notes_are_patched"]},
         "baseline": {"status": "verified_here"},
@@ -171,7 +172,9 @@ def _task(session_factory, repo, base_commit):
         TaskService(session).apply_admission_decision(
             task_id, TaskStatus.ELIGIBLE, base_commit=base_commit,
             admission_record=AdmissionRecord(reason="controlled fixture",
-                                             evidence=["local_git_head"]))
+                evidence=["local_git_head", "pack:scheduler-chain-pack",
+                          "scope-sha256-v1:" + scope_evidence_sha256(
+                              ScopeSpec(allowed_paths=("answer.txt",)))]))
     return task_id
 
 
@@ -528,18 +531,33 @@ def test_an_independent_failure_does_not_commit_a_formal_result(
                     reason="requires an explicitly enabled Docker probe")
 @pytest.mark.skipif(os.name != "nt",
                     reason="trusted pytest baseline and public check need a Windows Job")
-@pytest.mark.parametrize("patch,expected", [
-    (POSITIVE_PATCH, "passed"),
-    (COSMETIC_PATCH, "failed"),
+@pytest.mark.parametrize("patch,expected,scope_mode", [
+    (POSITIVE_PATCH, "passed", "bound"),
+    (COSMETIC_PATCH, "failed", "bound"),
+    (POSITIVE_PATCH, "passed", "legacy"),
+    (POSITIVE_PATCH, "passed", "unsupported"),
 ])
 def test_default_scheduler_driver_handles_independent_outcomes(
-    worker_session_factory, tmp_path, monkeypatch, patch, expected,
+    worker_session_factory, tmp_path, monkeypatch, patch, expected, scope_mode,
 ):
     """Drive real stages and evaluate both valid and public-only patches."""
     from devflow_ai.model_gateways import ModelGateways
 
     factory = worker_session_factory
     task_id, request, _ = _prepare_fixture(factory, tmp_path, monkeypatch)
+    if scope_mode == "legacy":
+        with factory.begin() as session:
+            session.get(Task, task_id).admission_record = {
+                "reason": "legacy fixture", "evidence": ["local_git_head"]}
+    elif scope_mode == "unsupported":
+        pack_file = tmp_path / "pack" / "task.json"
+        payload = json.loads(pack_file.read_text(encoding="utf-8"))
+        payload["scope"] = {"allowed_paths": ["*.txt"]}
+        pack_file.write_text(json.dumps(payload), encoding="utf-8")
+        with factory.begin() as session:
+            session.get(Task, task_id).admission_record = {
+                "reason": "unsupported fixture", "evidence": ["pack:scheduler-chain-pack",
+                    "scope-sha256-v1:" + scope_evidence_sha256(ScopeSpec(allowed_paths=("*.txt",)))]}
     worker_id = "scheduler-default-driver"
     stubs = _Stubs(patch=patch)
     gateways = ModelGateways(
@@ -562,6 +580,30 @@ def test_default_scheduler_driver_handles_independent_outcomes(
         assert session.get(Task, task_id).status is (
             TaskStatus.AWAITING_REVIEW if expected == "passed" else TaskStatus.RUNNING)
         assert len(_verifications(factory, run.id)) == (1 if expected == "passed" else 0)
+        calls = session.scalars(select(ToolCall).where(ToolCall.run_id == run.id,
+            ToolCall.tool_name == "run_command")).all()
+        skill_calls = [call for call in calls if (call.args or {}).get("skill") == {
+            "name": "run_registered_check", "version": "2", "pytest_capture": True}]
+        assert len(skill_calls) == 2
+        purposes = {session.get(AgentExecution, call.agent_execution_id).input["purpose"]: call
+                    for call in skill_calls}
+        assert purposes["baseline"].status.value == "failed"  # constructed buggy baseline
+        assert purposes["post_patch_verification"].status.value == "succeeded"
+        diff_calls = session.scalars(select(ToolCall).where(ToolCall.run_id == run.id,
+            ToolCall.tool_name == "git_diff")).all()
+        scope_calls = [call for call in diff_calls if (call.args or {}).get("skill", {}).get("name") == "check_diff_scope"]
+        if scope_mode == "bound":
+            assert len(scope_calls) == 1 and scope_calls[0].args["skill"]["version"] == "2"
+            assert scope_calls[0].args["skill"]["scope_sha256"] == scope_evidence_sha256(
+                ScopeSpec(allowed_paths=("answer.txt",)))
+            verifier = session.get(AgentExecution, scope_calls[0].agent_execution_id)
+            assert verifier.output["scope_check"]["tool_call_id"] == str(scope_calls[0].id)
+            assert verifier.output["scope_check"]["result"] == "outside_declared_scope"
+            assert {item["path"] for item in verifier.output["scope_check"]["violations"]} == {"notes.txt"}
+        else:
+            assert not scope_calls
+            verifier = session.get(AgentExecution, purposes["post_patch_verification"].agent_execution_id)
+            assert "scope_check" not in verifier.output
         run_id = run.id
 
     replay = run_scheduler(request, session_factory=factory, worker_id=worker_id,

@@ -1,0 +1,45 @@
+{
+  "pack_id": "dev-rehearsal-target",
+  "schema_version": 1,
+  "title": "<一句话说明这个开发 Task 要解决的问题>",
+  "source": {
+    "issue_url": "https://example.invalid/issues/<编号>",
+    "repository_url": "https://example.invalid/<仓库名>",
+    "license": "<许可证>",
+    "issue_reference": "<仓库#编号>"
+  },
+  "base_commit": "<40 位小写 commit，必须等于 Task.base_commit 与仓库 HEAD>",
+  "environment": {
+    "python_requires": ">=3.11,<3.12",
+    "dependencies": ["pytest"],
+    "platform_notes": "<实际观察到的平台与解释器版本>"
+  },
+  "issue": {
+    "sanitized_problem": "<净化后的问题描述，不含答案与隐藏材料>",
+    "observable_error": "<能观察到什么错误>",
+    "expected_behavior": "<期望行为>"
+  },
+  "scope": {
+    "allowed_paths": ["src/"],
+    "forbidden_paths": []
+  },
+  "public_checks": {
+    "command": ["python", "-m", "pytest", "-q", "scenarios.py"],
+    "command_name": "pytest",
+    "target_tests": ["scenarios::test_placeholder"],
+    "notes": "命令里的 python 会被 entry 端替换成 --python-executable 指定的绝对路径。"
+  },
+  "baseline": {
+    "status": "not_reverified",
+    "notes": "每次 Run 仍然自己记录补丁前失败基线；这里的状态只描述准备时的观察。"
+  },
+  "external_connections": "none",
+  "policy": null,
+  "independent_suite": null,
+  "unverified": [
+    {"field": "policy", "reason": "开发演练不使用 benchmark policy 快照，实际快照以 Task 行里的为准。"},
+    {"field": "baseline", "reason": "未在本次 Run 之外重复核验。"},
+    {"field": "independent_suite",
+     "reason": "目标 rehearsal 不注入可信材料；如需用它做正式尝试，必须改成真实的 IndependentSuiteRef 并删掉本条。"}
+  ]
+}

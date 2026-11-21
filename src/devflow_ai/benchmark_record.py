@@ -22,10 +22,11 @@ SHA256_PATTERN = r"^[0-9a-f]{64}$"
 COMMIT_PATTERN = r"^[0-9a-f]{40}$"
 
 # Version 2 introduced: attempt_kind, independent_evaluation (incl. `verified`), correction,
-# task_id/run_id and public_checks.verified_*. A file without the field is read as version 1:
-# the older fields keep their meaning, the newer ones are simply absent, defaults apply, and
-# the record is reported as unversioned rather than assumed to carry the newer contract.
-SCHEMA_VERSION = 2
+# task_id/run_id and public_checks.verified_*. Version 3 adds attempt_context. A file without
+# the field is read as version 1: the older fields keep their meaning, the newer ones are simply
+# absent, defaults apply, and the record is reported as unversioned rather than assumed to carry
+# the newer contract.
+SCHEMA_VERSION = 3
 
 
 class RunOutcome(StrEnum):
@@ -55,6 +56,67 @@ class AttemptKind(StrEnum):
     FORMAL = "formal"
     REHEARSAL = "rehearsal"
     UNKNOWN = "unknown"
+
+
+class AttemptContext(BaseModel):
+    """What the process that ran the attempt knew about how it ended.
+
+    Two facts decide a verdict that the database rows cannot answer afterwards: whether the
+    attempt's deadline fired, and whether a finalization result existed. Nothing persists the
+    deadline, and a finalization dict only lives in the running process, so the attempt's own
+    entry is the only witness. Every field therefore has an explicit ``unknown`` value: a
+    record written before this field existed, or a reconstruction that cannot see the original
+    context, reads as unknown rather than as "no deadline, no finalization".
+
+    ``source`` names who observed it — the entry that ran the attempt, or a reconstruction.
+    It is a label, not a proof: a reader still decides whether that source was in a position
+    to know.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    deadline: Literal["fired", "not_fired", "unknown"] = "unknown"
+    finalization: Literal["recorded", "not_recorded", "unknown"] = "unknown"
+    finalization_outcome: str | None = Field(default=None, min_length=1, max_length=100)
+    # The execution manifest digest this attempt ran under, when the entry verified one. It ties
+    # the record to the version claim: a record copied from another version disagrees here.
+    execution_sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    source: str = Field(min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def only_a_recorded_finalization_has_an_outcome(self) -> "AttemptContext":
+        if self.finalization != "recorded" and self.finalization_outcome is not None:
+            raise ValueError(
+                "attempt_context.finalization_outcome is only meaningful when a finalization "
+                "was recorded")
+        return self
+
+    @classmethod
+    def observed(
+        cls, *, deadline_fired: bool, finalization: dict | None, source: str,
+        execution_sha256: str | None = None,
+    ) -> "AttemptContext":
+        """Build the context from what the running entry itself just observed."""
+        recorded = isinstance(finalization, dict)
+        outcome = None
+        if recorded:
+            raw = finalization.get("outcome")
+            if isinstance(raw, str) and raw.strip():
+                outcome = raw.strip()[:100]
+        return cls(
+            deadline="fired" if deadline_fired else "not_fired",
+            finalization="recorded" if recorded else "not_recorded",
+            finalization_outcome=outcome, execution_sha256=execution_sha256, source=source)
+
+    @classmethod
+    def unknown(cls, *, source: str, execution_sha256: str | None = None) -> "AttemptContext":
+        """Build the context for a writer that did not see the attempt itself.
+
+        ``execution_sha256`` may still be passed when the *persisted* Run row records one: that
+        is a stored fact, not a reconstruction, and the caller says so through ``source``.
+        """
+        return cls(deadline="unknown", finalization="unknown",
+                   execution_sha256=execution_sha256, source=source)
 
 
 class PublicCheckSummary(BaseModel):
@@ -153,6 +215,9 @@ class BenchmarkRunRecord(BaseModel):
     attempt_index: int = Field(ge=1)
     # Defaulting to unknown keeps old records readable without assuming they were formal.
     attempt_kind: AttemptKind = AttemptKind.UNKNOWN
+    # Absent on records written before the field existed, which reads as "unknown" rather than
+    # as a statement about the deadline or the finalization step.
+    attempt_context: AttemptContext | None = None
     started_at: str = Field(min_length=1)
     finished_at: str = Field(min_length=1)
     outcome: RunOutcome
@@ -269,31 +334,78 @@ def _attempt_identity(record: BenchmarkRunRecord) -> tuple:
             record.started_at)
 
 
+_IMMUTABLE_RECORD_FIELDS = (
+    "pack_id", "base_commit", "task_id", "run_id", "attempt_index", "attempt_kind",
+    "started_at", "finished_at", "outcome", "model_id", "policy_version", "operator",
+    "formal", "artifacts", "attempt_context",
+)
+
+
+def _immutable_record_differences(first: BenchmarkRunRecord, second: BenchmarkRunRecord) -> list[str]:
+    return [name for name in _IMMUTABLE_RECORD_FIELDS if getattr(first, name) != getattr(second, name)]
+
+
 def deduplicate_records(loaded, *, include_superseded: bool = False) -> tuple[list, dict]:
     """Pick one record per attempt and say what was dropped.
 
     Originals, human-reviewed copies and corrected copies all describe the same attempt, and
     a correction names both of its sources by digest. Prefer, in order: the copy nothing
-    supersedes, then a corrected copy, then a copy carrying a human decision. Anything that
-    cannot be decided from the files alone is reported as a conflict and left out of the
-    sample — a conflict is not something to guess at.
+    supersedes, then a corrected copy, then a copy carrying a human decision. Copies must
+    agree on immutable attempt fields, and a correction may supersede only files for the
+    same attempt. Anything ambiguous is reported as a conflict and excluded. Missing
+    referenced files and claims in a record still require trusted external verification.
     """
     loaded = list(loaded)
+    # Public callers can supply a previously parsed object. Re-read each file once and
+    # verify that the exact bytes used for its digest still describe that object.
+    digests = {}
+    seen_paths = set()
+    for path, record in loaded:
+        canonical = Path(path).resolve()
+        if canonical in seen_paths:
+            raise ValueError("The same run record path was supplied more than once")
+        seen_paths.add(canonical)
+        try:
+            raw = Path(path).read_bytes()
+            current = parse_run_record(raw)
+        except (OSError, ValueError) as error:
+            raise ValueError(f"Run record cannot be read consistently: {Path(path).name}") from error
+        if current != record:
+            raise ValueError(f"Run record changed after it was read: {Path(path).name}")
+        digests[path] = sha256(raw).hexdigest()
     if include_superseded:
         return [record for _, record in loaded], {
             "superseded_excluded": 0, "conflicts": [], "conflicts_excluded": 0}
-    digests = {path: sha256(Path(path).read_bytes()).hexdigest() for path, _ in loaded}
-    superseded = set()
-    for _, record in loaded:
-        if record.correction is not None:
-            superseded.add(record.correction.corrects_sha256)
-            superseded.add(record.correction.reviewed_sha256)
     groups: dict[tuple, list] = {}
     for path, record in loaded:
         groups.setdefault(_attempt_identity(record), []).append((path, record))
+    digest_identities: dict[str, set[tuple]] = {}
+    for path, record in loaded:
+        digest_identities.setdefault(digests[path], set()).add(_attempt_identity(record))
+    superseded: dict[tuple, set[str]] = {}
+    invalid_links: set[tuple] = set()
+    for _, record in loaded:
+        if record.correction is None:
+            continue
+        identity = _attempt_identity(record)
+        references = (record.correction.corrects_sha256, record.correction.reviewed_sha256)
+        if any(digest_identities.get(digest, set()) - {identity} for digest in references):
+            invalid_links.add(identity)
+            continue
+        superseded.setdefault(identity, set()).update(references)
     chosen, dropped, conflicts = [], 0, []
     for identity, items in groups.items():
-        live = [(path, record) for path, record in items if digests[path] not in superseded]
+        if identity in invalid_links:
+            conflicts.append({"identity": list(identity), "files": sorted(p.name for p, _ in items),
+                              "reason": "a correction references a different attempt"})
+            continue
+        differences = sorted({name for _, record in items[1:]
+                              for name in _immutable_record_differences(items[0][1], record)})
+        if differences:
+            conflicts.append({"identity": list(identity), "files": sorted(p.name for p, _ in items),
+                              "reason": "copies disagree on immutable fields: " + ", ".join(differences)})
+            continue
+        live = [(path, record) for path, record in items if digests[path] not in superseded.get(identity, set())]
         dropped += len(items) - len(live)
         if len(live) == 1:
             chosen.append(live[0][1])
@@ -350,8 +462,13 @@ def summarize_run_records(
         and record.human_review.conclusion == "rejected")
     return {
         "sample_size": len(records),
+        # A file that does not declare a version reads as version 1, so that is what this
+        # counts. Records from an older but declared schema are counted separately: reporting
+        # them as unversioned would overstate what the file said.
         "records_without_schema_version": sum(
-            1 for record in records if record.schema_version < SCHEMA_VERSION),
+            1 for record in records if record.schema_version <= 1),
+        "records_below_current_schema": sum(
+            1 for record in records if 1 < record.schema_version < SCHEMA_VERSION),
         "non_formal_excluded": (0 if include_non_formal else len(non_formal)),
         "rehearsals_excluded": (0 if include_non_formal else sum(
             1 for item in non_formal if item.attempt_kind is AttemptKind.REHEARSAL)),
@@ -389,9 +506,7 @@ def corrected_record(
     come from the reviewed copy unchanged, and the correction block names both source files
     by digest so a reader can walk back to them.
     """
-    identity = ("pack_id", "base_commit", "attempt_index", "attempt_kind", "outcome", "formal")
-    differing = [name for name in identity
-                 if getattr(record, name) != getattr(reviewed, name)]
+    differing = _immutable_record_differences(record, reviewed)
     if differing:
         raise ValueError(
             "The reviewed copy differs from the original in: " + ", ".join(differing))
@@ -423,7 +538,9 @@ def _correct_record(args, *, session_factory=None) -> int:
 
     raw_run_id = args.run
     try:
-        records = (load_run_record(Path(args.record)), load_run_record(Path(args.reviewed)))
+        original_bytes = Path(args.record).read_bytes()
+        reviewed_bytes = Path(args.reviewed).read_bytes()
+        records = (parse_run_record(original_bytes), parse_run_record(reviewed_bytes))
     except (OSError, ValueError) as error:
         return _configuration_error(f"Run record is unreadable: {type(error).__name__}")
     original, reviewed = records
@@ -436,6 +553,24 @@ def _correct_record(args, *, session_factory=None) -> int:
         run_id = UUID(str(raw_run_id))
     except (TypeError, ValueError):
         return _configuration_error("run must be a UUID")
+    for label, item in (("record", original), ("reviewed", reviewed)):
+        if item.run_id is not None:
+            try:
+                if UUID(item.run_id) != run_id:
+                    return _configuration_error(f"{label} run_id does not match the selected Run")
+            except ValueError:
+                return _configuration_error(f"{label} run_id is not a UUID")
+    differing = _immutable_record_differences(original, reviewed)
+    if differing:
+        return _configuration_error("The reviewed copy differs from the original in: " + ", ".join(differing))
+    if original.run_id is None and original.formal is None:
+        return _configuration_error("A record without run_id needs formal verification evidence to bind a Run")
+    expected_task_id = None
+    if original.task_id is not None:
+        try:
+            expected_task_id = UUID(original.task_id)
+        except ValueError:
+            return _configuration_error("record task_id is not a UUID")
     artifacts_root = Path(args.artifacts_root)
     if not artifacts_root.is_dir():
         return _configuration_error("artifacts-root must be an existing directory")
@@ -453,6 +588,11 @@ def _correct_record(args, *, session_factory=None) -> int:
             engine = create_db_engine()
             session_factory = create_session_factory(engine)
         with session_factory() as session:
+            if expected_task_id is not None:
+                from devflow_ai.models import Run
+                bound_run = session.get(Run, run_id)
+                if bound_run is None or bound_run.task_id != expected_task_id:
+                    return _configuration_error("record task_id does not match the selected Run")
             decision = classify_outcome(
                 session, run_id, deadline_fired=False,
                 independent_suite_version=suite_version, artifact_root=artifacts_root)
@@ -467,13 +607,24 @@ def _correct_record(args, *, session_factory=None) -> int:
     if decision.outcome.value != original.outcome.value:
         return _configuration_error(
             "The re-derived outcome differs from the record; a correction cannot change it")
+    if original.formal is not None and (decision.formal is None
+            or decision.formal.verification_id != original.formal.verification_id
+            or decision.formal.independent_suite_version != original.formal.independent_suite_version
+            or (original.formal.independent_receipt_sha256 is not None and
+                decision.formal.independent_receipt_sha256 != original.formal.independent_receipt_sha256)):
+        return _configuration_error("The selected Run's formal verification does not match the record")
+    try:
+        if paths["record"].read_bytes() != original_bytes or paths["reviewed"].read_bytes() != reviewed_bytes:
+            return _configuration_error("A source record changed during correction; no copy was written")
+    except OSError:
+        return _configuration_error("A source record became unavailable during correction")
     try:
         corrected = corrected_record(
             original, reviewed, public_checks=decision.public_checks,
             independent=decision.independent, basis=args.basis,
             corrected_by=args.corrected_by, corrected_at=args.corrected_at,
-            corrects_sha256=sha256(paths["record"].read_bytes()).hexdigest(),
-            reviewed_sha256=sha256(paths["reviewed"].read_bytes()).hexdigest(),
+            corrects_sha256=sha256(original_bytes).hexdigest(),
+            reviewed_sha256=sha256(reviewed_bytes).hexdigest(),
             note=(f"corrected {args.corrected_at} by {args.corrected_by}: "
                   f"summary re-derived from {args.basis}"))
     except ValueError as error:
@@ -547,8 +698,13 @@ def main(argv: list[str] | None = None, *, session_factory=None) -> int:
                 return 1
         # One attempt, one sample: originals, reviewed copies and corrected copies all
         # describe the same attempt, and a correction names both of its sources.
-        records, dedupe = deduplicate_records(
-            loaded, include_superseded=args.include_superseded)
+        try:
+            records, dedupe = deduplicate_records(
+                loaded, include_superseded=args.include_superseded)
+        except (OSError, ValueError) as error:
+            print(json.dumps({"event": "run_record_unreadable", "error_type": type(error).__name__}),
+                  file=sys.stderr)
+            return 1
         print(json.dumps({"event": "run_records_summarized", **dedupe,
                           **summarize_run_records(
                               records, include_non_formal=args.include_non_formal)}))

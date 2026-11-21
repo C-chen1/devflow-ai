@@ -5,6 +5,7 @@ from io import BytesIO
 import os
 import json
 from pathlib import Path
+from re import fullmatch
 from threading import Event
 from time import monotonic
 from typing import Literal, TypeVar
@@ -16,7 +17,7 @@ from devflow_ai.artifacts import ArtifactVerificationError, ToolArtifactResult, 
 from devflow_ai.baseline import BaselineUnavailableError, validate_coder_baseline
 from devflow_ai.config import LeaseConfig
 from devflow_ai.coder import CoderOutput, PatchReady
-from devflow_ai.context import AgentReadEvidenceError, ReadEvidenceRef, resolve_read_evidence
+from devflow_ai.context import AgentReadEvidenceError, MEMORY_RECALL_CONTEXT_KEY, ReadEvidenceRef, resolve_read_evidence
 from devflow_ai.database import get_database_time
 from devflow_ai.enums import AgentExecutionStatus, AgentRole, FailureCategory, RunStatus, TaskStatus, ToolCallStatus, VerificationResult
 from devflow_ai.harness import (
@@ -45,6 +46,7 @@ from devflow_ai.harness import (
 )
 from devflow_ai.models import AgentExecution, Artifact, FailureRecord, Handoff, Run, Task, ToolCall, Verification
 from devflow_ai.policy import PolicyConfig
+from devflow_ai.task_pack import admission_has_scope_digest
 from devflow_ai.planner import PlanReady, PlannerOutput
 from devflow_ai.process_evidence import proves_process_not_started
 from devflow_ai.repositories import RunRepository, TaskRepository, ToolCallRepository
@@ -83,6 +85,10 @@ _MUTATING_TOOL_NAMES = ("git_clone", "git_checkout", "apply_patch", "run_command
 
 class RunCreationConflictError(ValueError):
     """A Run creation key was reused with different creation parameters."""
+
+
+class RunVersionConflictError(ValueError):
+    """A Run would start under a different execution version than the Task's history."""
 
 
 class TaskClaimBusyError(RuntimeError):
@@ -238,6 +244,45 @@ class LeaseRenewal(BaseModel):
     lease_expires_at: datetime
 
 
+def _validated_execution_sha256(execution_sha256: str | None) -> str | None:
+    """Accept a pinned execution digest or None (unknown); never a placeholder string."""
+    if execution_sha256 is None:
+        return None
+    if (not isinstance(execution_sha256, str)
+            or fullmatch(r"[0-9a-f]{64}", execution_sha256) is None):
+        raise ValueError("execution_sha256 must be 64 lowercase hexadecimal characters or None")
+    return execution_sha256
+
+
+def _run_version_for_new_attempt(
+    runs, execution_sha256: str | None,
+) -> str | None:
+    """Pin a later attempt to the Task's verified execution version.
+
+    Once any Run of this Task carries a verified digest, every later attempt — retry,
+    rediagnosis, replay-driven restart — has to use the same one. A history that is still
+    entirely unknown may be pinned from here on, but the pin applies to the new Run only;
+    earlier Runs are never backfilled. A history that already mixes versions cannot be
+    continued at all.
+    """
+    known = {item.execution_sha256 for item in runs if item.execution_sha256 is not None}
+    if not known:
+        return _validated_execution_sha256(execution_sha256)
+    if len(known) > 1:
+        raise RunVersionConflictError(
+            "This Task's Run history already mixes execution versions; it cannot continue")
+    pinned = known.pop()
+    if execution_sha256 is None:
+        raise RunVersionConflictError(
+            "This Task's Run history is pinned to an execution version; the next attempt must "
+            "verify and pin the same one")
+    if execution_sha256 != pinned:
+        raise RunVersionConflictError(
+            "This attempt's execution version differs from the Task's earlier Runs; refusing to "
+            "switch versions mid-history")
+    return pinned
+
+
 class RunCoordinator:
     def __init__(self, session: Session, lease_config: LeaseConfig | None = None):
         self.session = session
@@ -249,13 +294,20 @@ class RunCoordinator:
         self, task_id: UUID, worker_id: str, creation_idempotency_key: str, *,
         expected_base_commit: str | None = None,
         expected_policy: PolicyConfig | None = None,
+        check_admission_record: bool = False,
+        expected_admission_record: dict | None = None,
+        execution_sha256: str | None = None,
     ) -> tuple[Run, bool]:
         """Commit an initial Run or replay its result; replay grants no new lease.
 
-        ``expected_base_commit`` and ``expected_policy`` are re-checked **inside** the Task
-        row lock, in the same transaction that creates the Run. A caller that checked the
+        Prepared commit, Policy and, when requested, admission evidence are re-checked
+        **inside** the Task row lock, in the same transaction that creates the Run. A caller that checked the
         Task before asking for the claim therefore cannot create a Run from assumptions
         that the Task has since contradicted; a mismatch is a state conflict, not a Run.
+
+        ``execution_sha256`` is the digest the caller verified against the pinned manifest
+        before asking for the claim. It is stored on the Run in this same transaction, so the
+        Run cannot exist without the version decision; passing None records "unknown".
         """
         for name, value in (
             ("worker_id", worker_id),
@@ -264,6 +316,7 @@ class RunCoordinator:
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be a non-blank string")
 
+        execution_sha256 = _validated_execution_sha256(execution_sha256)
         with self.session.begin():
             run = self._get_replay(task_id, worker_id, creation_idempotency_key)
             created = False
@@ -279,8 +332,17 @@ class RunCoordinator:
                     run = self._create_initial_run(
                         task, worker_id, creation_idempotency_key,
                         expected_base_commit=expected_base_commit,
-                        expected_policy=expected_policy)
+                        expected_policy=expected_policy,
+                        check_admission_record=check_admission_record,
+                        expected_admission_record=expected_admission_record,
+                        execution_sha256=execution_sha256)
                     created = True
+            if not created and run.execution_sha256 != execution_sha256:
+                # The Run this key already created was started under a different verified
+                # version (or under none). Reporting it as "the same claim" would let an
+                # unverified caller adopt a pinned Run.
+                raise RunVersionConflictError(
+                    "This Run already exists under a different execution version")
         return run, created
 
     def claim_next_initial_run(self, worker_id: str) -> Run | None:
@@ -303,8 +365,16 @@ class RunCoordinator:
                 and policy.budget.max_tool_calls_per_run >= 1
                 and policy.budget.max_llm_tokens_per_run >= 1)
 
-    def start_retry_run(self, task_id: UUID, worker_id: str, creation_idempotency_key: str) -> tuple[Run, bool]:
-        """Create one policy-authorized implementation retry or replay its existing receipt."""
+    def start_retry_run(
+        self, task_id: UUID, worker_id: str, creation_idempotency_key: str, *,
+        execution_sha256: str | None = None,
+    ) -> tuple[Run, bool]:
+        """Create one policy-authorized implementation retry or replay its existing receipt.
+
+        A retry continues the Task's Run history, so it may not switch execution versions: when
+        an earlier Run carries a verified digest, this attempt must pin the same one or it is
+        refused. ``None`` is "unknown" for a history that has never been pinned.
+        """
         for value in (worker_id, creation_idempotency_key):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError("worker_id and creation_idempotency_key must be nonblank")
@@ -350,6 +420,7 @@ class RunCoordinator:
                     run = Run(task_id=task_id, attempt_number=len(runs) + 1, status=RunStatus.RUNNING,
                         creation_idempotency_key=creation_idempotency_key, worker_id=worker_id,
                         recovery_action="REVISE_IMPLEMENTATION",
+                        execution_sha256=_run_version_for_new_attempt(runs, execution_sha256),
                         started_at=database_time, last_heartbeat_at=database_time,
                         lease_expires_at=database_time + timedelta(seconds=lease_seconds))
                     self.run_repository.add(run)
@@ -359,10 +430,14 @@ class RunCoordinator:
                 raise RunCreationConflictError("A rediagnosis Run creation key cannot identify a retry")
             if run.attempt_number == 1:
                 raise RunCreationConflictError("An initial Run creation key cannot identify a retry")
+            if not created and run.execution_sha256 != execution_sha256:
+                raise RunVersionConflictError(
+                    "A retry resume must use the execution version recorded for its Run")
         return run, created
 
     def start_rediagnosis_run(
-        self, task_id: UUID, worker_id: str, creation_idempotency_key: str,
+        self, task_id: UUID, worker_id: str, creation_idempotency_key: str, *,
+        execution_sha256: str | None = None,
     ) -> tuple[Run, bool]:
         """Create one UNKNOWN_FAILURE rediagnosis reservation and its action marker atomically.
 
@@ -432,6 +507,7 @@ class RunCoordinator:
                     run = Run(task_id=task_id, attempt_number=len(runs) + 1, status=RunStatus.RUNNING,
                         creation_idempotency_key=creation_idempotency_key, worker_id=worker_id,
                         recovery_action="REDIAGNOSE", recovery_start_tracking="v1",
+                        execution_sha256=_run_version_for_new_attempt(runs, execution_sha256),
                         started_at=database_time, last_heartbeat_at=database_time,
                         lease_expires_at=database_time + timedelta(seconds=lease_seconds))
                     self.run_repository.add(run)
@@ -441,6 +517,9 @@ class RunCoordinator:
                 raise RunCreationConflictError("Another recovery action cannot identify a rediagnosis Run")
             if run.attempt_number == 1:
                 raise RunCreationConflictError("An initial Run creation key cannot identify a rediagnosis")
+            if not created and run.execution_sha256 != execution_sha256:
+                raise RunVersionConflictError(
+                    "A rediagnosis resume must use the execution version recorded for its Run")
         return run, created
 
     def begin_rediagnosis_start(self, run_id: UUID, worker_id: str) -> bool:
@@ -1052,12 +1131,18 @@ class RunCoordinator:
         require_unpatched: bool = False,
         verify_baseline: bool = False,
         public_tests_sha256: Mapping[str, str] | None = None,
+        registered_check_skill_version: str | None = None,
     ) -> UUID:
         """Execute one server-registered command for a Verifier with an audited result."""
         if stop_event is None:
             raise ValueError("A stop event is required")
         registry = dict(registry)
         pytest_command_names = frozenset(pytest_command_names)
+        if registered_check_skill_version not in (None, "1", "2"):
+            raise ValueError("Unsupported registered-check skill version")
+        if registered_check_skill_version == "1" and (
+                command_name in pytest_command_names or pythonpath_relative is not None):
+            raise ValueError("Registered-check v1 does not support report capture or Python path")
 
         def execute(call_id: UUID) -> ToolCallResult:
             with self.session.begin():
@@ -1188,6 +1273,11 @@ class RunCoordinator:
         if isinstance(command, tuple) and command and all(isinstance(part, str) and part for part in command):
             command_hash = command_evidence_sha256(command, pythonpath_relative)
         args = {"command_name": command_name, "command_sha256": command_hash}
+        if registered_check_skill_version is not None:
+            # Trusted control-plane metadata, committed with the request before execution.
+            # It identifies the declared Skill, not an immutable executable-code snapshot.
+            args["skill"] = {"name": "run_registered_check", "version": registered_check_skill_version,
+                             "pytest_capture": command_name in pytest_command_names}
         if public_tests_sha256 is not None:
             # Digest of the copy that was executed, so acceptance can compare it with the
             # trusted pack rather than trusting that the path still holds those bytes.
@@ -1209,10 +1299,19 @@ class RunCoordinator:
     def execute_verifier_git_diff(
         self, run_id: UUID, worker_id: str, *, agent_execution_id: UUID,
         workspace_root: Path, artifact_root: Path, stop_event: Event,
+        diff_scope_skill_sha256: str | None = None,
+        diff_scope_skill_version: str | None = None,
     ) -> UUID:
         """Audit a Verifier's observed tracked diff against the Task's pinned base."""
         if stop_event is None:
             raise ValueError("A stop event is required")
+        if diff_scope_skill_sha256 is not None and (not isinstance(diff_scope_skill_sha256, str)
+                or len(diff_scope_skill_sha256) != 64
+                or any(c not in "0123456789abcdef" for c in diff_scope_skill_sha256)):
+            raise ValueError("Invalid scope skill digest")
+        if (diff_scope_skill_sha256 is None) != (diff_scope_skill_version is None) or (
+                diff_scope_skill_version is not None and diff_scope_skill_version not in ("1", "2")):
+            raise ValueError("Invalid scope skill version and digest")
         with self.session.begin():
             self.assert_execution_right(run_id, worker_id)
             base_commit = self.session.scalar(select(Task.base_commit).join(Run, Run.task_id == Task.id).where(Run.id == run_id))
@@ -1223,11 +1322,14 @@ class RunCoordinator:
             with self.session.begin():
                 policy = self.assert_execution_right(run_id, worker_id)
                 execution = self.session.get(AgentExecution, agent_execution_id)
-                actual_base = self.session.scalar(select(Task.base_commit).join(Run, Run.task_id == Task.id).where(Run.id == run_id))
+                actual_base, admission_record = self.session.execute(select(Task.base_commit, Task.admission_record)
+                    .join(Run, Run.task_id == Task.id).where(Run.id == run_id)).one()
                 if execution.agent_role != AgentRole.VERIFIER.value.lower():
                     return ToolCallResult(status=ToolCallStatus.DENIED, reason="VERIFIER_ROLE_REQUIRED")
                 if actual_base != base_commit:
                     return ToolCallResult(status=ToolCallStatus.DENIED, reason="TASK_BASE_CHANGED")
+                if diff_scope_skill_version == "2" and not admission_has_scope_digest(admission_record, diff_scope_skill_sha256):
+                    return ToolCallResult(status=ToolCallStatus.DENIED, reason="TASK_SCOPE_BINDING_MISSING_OR_CHANGED")
                 timeout = policy.budget.tool_call_timeout_seconds
             try:
                 result = inspect_workspace_diff(
@@ -1272,12 +1374,16 @@ class RunCoordinator:
             output = self._git_preview_result(result.diff.preview, ToolCallStatus.SUCCEEDED, 0, None)
             return output.model_copy(update={"artifacts": (*output.artifacts, artifact, numstat_artifact)})
 
+        args = {"base_commit": base_commit}
+        if diff_scope_skill_sha256 is not None:
+            args["skill"] = {"name": "check_diff_scope", "version": diff_scope_skill_version,
+                             "scope_sha256": diff_scope_skill_sha256}
         with workspace_operation_lock(
             self.session.get_bind(), run_id, stop_event=stop_event, check_unsettled_mutations=True,
         ) as workspace_receipt:
             return self.execute_agent_tool_call(
                 run_id, worker_id, agent_execution_id=agent_execution_id,
-                tool_name="git_diff", args={"base_commit": base_commit},
+                tool_name="git_diff", args=args,
                 registered_tools={"git_diff"}, execute=execute, stop_event=stop_event,
                 workspace_receipt=workspace_receipt,
             )
@@ -1356,6 +1462,7 @@ class RunCoordinator:
         ) as workspace_receipt:
             def verify_context():
                 self.assert_execution_right(run_id, worker_id)
+                self.assert_independent_memory_isolation(run_id)
                 draft = load_semantic_review_draft(self.session, run_id, agent_execution_id,
                     artifact_id=draft_artifact_id, artifact_root=artifact_root)
                 context, comparison = build_verifier_semantic_context(self.session, run_id, agent_execution_id,
@@ -1727,6 +1834,8 @@ class RunCoordinator:
                 verifier_id = UUID(data["verifier_execution_id"])
                 draft_id = UUID(data["draft_artifact_id"])
                 independent_id = UUID(data["independent_artifact_id"]) if data.get("independent_artifact_id") else None
+                if independent_id is not None:
+                    self.assert_independent_memory_isolation(run_id)
                 history = self._read_recovery_history(run, signature)
                 limit_reached = (history.retries_started >= policy.budget.max_retries_per_task
                     or history.previous_signature_occurrences + 1 >= policy.budget.max_same_signature_occurrences)
@@ -1797,6 +1906,8 @@ class RunCoordinator:
                 verifier_id = UUID(data["verifier_execution_id"])
                 draft_id = UUID(data["draft_artifact_id"])
                 independent_id = UUID(data["independent_artifact_id"]) if data.get("independent_artifact_id") else None
+                if independent_id is not None:
+                    self.assert_independent_memory_isolation(run_id)
                 history = self._read_recovery_history(run, signature)
                 _, rediagnoses_pending, _ = self._read_rediagnosis_usage(task.id)
                 # Pending tracked Runs have not started but reserve quota until
@@ -1873,6 +1984,7 @@ class RunCoordinator:
                 task = self.session.get(Task, run.task_id)
                 if task is None or task.id != config.task_id or task.base_commit != config.base_commit or task.status != TaskStatus.RUNNING:
                     raise VerificationEvidenceError("Task or base does not match verification configuration")
+                self.assert_independent_memory_isolation(run_id)
                 draft = load_semantic_review_draft(self.session, run_id, agent_execution_id,
                     artifact_id=draft_artifact_id, artifact_root=artifact_root)
                 receipt = load_independent_evaluation(self.session, run_id, agent_execution_id,
@@ -1926,7 +2038,10 @@ class RunCoordinator:
                 self.session.add(verification)
                 self.session.flush()
                 execution.status = AgentExecutionStatus.SUCCEEDED
+                scope_check = (execution.output or {}).get("scope_check")
                 execution.output = {"outcome": "VERIFICATION_PASSED", "verification_id": str(verification.id)}
+                if scope_check is not None:
+                    execution.output["scope_check"] = scope_check
                 run.status = RunStatus.PASSED
                 run.finished_at = get_database_time(self.session)
                 task.status = TaskStatus.AWAITING_REVIEW
@@ -1936,6 +2051,7 @@ class RunCoordinator:
         self, run_id: UUID, worker_id: str, *, agent_execution_id: UUID,
         draft_artifact_id: UUID, missing_evidence: tuple[str, ...], preliminary_public_outcome: str,
         external_connections_declaration: Literal["unknown", "none", "required"] = "unknown",
+        scope_check: dict | None = None,
     ) -> None:
         """Keep an incomplete Verifier resumable while recording its preliminary result."""
         if not missing_evidence or preliminary_public_outcome not in ("passed", "failed", "blocked"):
@@ -1957,6 +2073,8 @@ class RunCoordinator:
                                 "missing_evidence": list(missing_evidence),
                                 "preliminary_public_outcome": preliminary_public_outcome,
                                 "external_connections_declaration": external_connections_declaration}
+            if scope_check is not None:
+                execution.output["scope_check"] = scope_check
 
     def execute_patch_path_check(
         self, run_id: UUID, worker_id: str, *, agent_execution_id: UUID,
@@ -2285,6 +2403,17 @@ class RunCoordinator:
             raise RuntimeError("Execution-right checks require a caller-owned transaction")
         _, policy = self._lock_and_check_execution_right(run_id, worker_id)
         return policy
+
+    def assert_independent_memory_isolation(self, run_id: UUID) -> None:
+        """Memory-assisted Tasks cannot claim an independent benchmark result."""
+        task_id = self.session.scalar(select(Run.task_id).where(Run.id == run_id))
+        if task_id is None:
+            raise VerificationEvidenceError("Run is unavailable")
+        used = self.session.scalar(select(exists().where(
+            AgentExecution.run_id == Run.id, Run.task_id == task_id,
+            AgentExecution.input.has_key(MEMORY_RECALL_CONTEXT_KEY))))
+        if used:
+            raise VerificationEvidenceError("Memory-assisted Task cannot use independent evaluation")
 
     def mark_expired_run_tool_calls_unknown(self, run_id: UUID) -> int:
         """Mark unsettled calls after checking the locked Run's lease against database time."""
@@ -2757,6 +2886,9 @@ class RunCoordinator:
         self, task: Task, worker_id: str, creation_idempotency_key: str, *,
         expected_base_commit: str | None = None,
         expected_policy: PolicyConfig | None = None,
+        check_admission_record: bool = False,
+        expected_admission_record: dict | None = None,
+        execution_sha256: str | None = None,
     ) -> Run:
         if task.status != TaskStatus.ELIGIBLE:
             raise TaskStateConflictError(
@@ -2778,6 +2910,8 @@ class RunCoordinator:
         if expected_policy is not None and policy.model_dump() != expected_policy.model_dump():
             raise TaskStateConflictError(
                 f"Task {task.id} Policy snapshot changed since this Run was prepared")
+        if check_admission_record and task.admission_record != expected_admission_record:
+            raise TaskStateConflictError(f"Task {task.id} admission record changed since this Run was prepared")
         database_time = get_database_time(self.session)
         lease_seconds = min(
             self.lease_config.lease_duration_seconds, policy.budget.max_run_duration_seconds,
@@ -2791,6 +2925,7 @@ class RunCoordinator:
             started_at=database_time,
             last_heartbeat_at=database_time,
             lease_expires_at=database_time + timedelta(seconds=lease_seconds),
+            execution_sha256=_validated_execution_sha256(execution_sha256),
         )
         self.run_repository.add(run)
         task.status = TaskStatus.RUNNING

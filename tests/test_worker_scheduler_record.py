@@ -101,6 +101,12 @@ def test_a_finished_attempt_writes_a_record_a_reviewer_can_read(
     assert record.outcome.value == "incomplete"
     assert record.formal is None
     assert "finalization=" in record.notes
+    # The entry that ran the attempt is the witness for its end conditions, so it records
+    # them instead of leaving a later reader to guess.
+    assert record.attempt_context is not None
+    assert record.attempt_context.source == "worker_run"
+    assert record.attempt_context.deadline == "not_fired"
+    assert record.attempt_context.finalization != "unknown"
 
 
 def test_a_rehearsal_is_recorded_as_a_rehearsal(

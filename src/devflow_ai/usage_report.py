@@ -19,7 +19,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from devflow_ai.models import AgentExecution, Run
+from devflow_ai.models import AgentExecution, Run, Task
 
 
 class UsageReportError(RuntimeError):
@@ -32,15 +32,19 @@ def _entry_tokens(entry: dict) -> tuple[int, int, int, int]:
     if actual is None:
         reserved = entry.get("reserved_tokens")
         return 0, 0, 1, reserved if isinstance(reserved, int) else 0
-    return (int(actual.get("input_tokens") or 0), int(actual.get("output_tokens") or 0), 0, 0)
+    if not isinstance(actual, dict) or any(
+            type(actual.get(key)) is not int or actual[key] < 0
+            for key in ("input_tokens", "output_tokens")):
+        raise UsageReportError("Recorded actual usage has missing or invalid token counts")
+    return actual["input_tokens"], actual["output_tokens"], 0, 0
 
 
 def summarize_usage(executions) -> dict:
     """Sum committed usage by role.
 
     ``executions`` yields ``(role, llm_usage)`` pairs. A usage blob without the
-    ``model_requests`` mapping is legacy and cannot be charged reliably, so it is counted
-    as one legacy execution and excluded from the token totals.
+    ``model_requests`` mapping is legacy and cannot be charged reliably. A NULL usage
+    also cannot distinguish no calls from missing data; both are marked unknown.
     """
     roles: dict[str, dict] = {}
     legacy = 0
@@ -48,13 +52,16 @@ def summarize_usage(executions) -> dict:
         row = roles.setdefault(role, {
             "role": role, "executions": 0, "requests": 0, "input_tokens": 0,
             "output_tokens": 0, "unsettled_requests": 0, "reserved_tokens": 0,
+            "unknown_usage_executions": 0,
         })
         row["executions"] += 1
         if usage is None:
+            row["unknown_usage_executions"] += 1
             continue
         requests = usage.get("model_requests")
         if requests is None:
             legacy += 1
+            row["unknown_usage_executions"] += 1
             continue
         for entry in requests.values():
             input_tokens, output_tokens, unsettled, reserved = _entry_tokens(entry)
@@ -73,8 +80,10 @@ def summarize_usage(executions) -> dict:
         "unsettled_requests": sum(row["unsettled_requests"] for row in ordered),
         "reserved_tokens": sum(row["reserved_tokens"] for row in ordered),
         "legacy_executions_without_usage": legacy,
-        "note": ("Committed usage only; an unsettled request is counted apart because it may "
-                 "still have been billed. Prompts and completions are never read here."),
+        "unknown_usage_executions": sum(row["unknown_usage_executions"] for row in ordered),
+        "note": ("Committed AgentExecution usage only; Task admission and other costs are not "
+                 "included. Unsettled or missing usage remains unknown. Prompts and completions "
+                 "are never read here."),
     }
 
 
@@ -91,48 +100,96 @@ def load_run_usage(session: Session, run_id: UUID) -> dict:
             "attempt_number": run.attempt_number, **summarize_usage(rows)}
 
 
+def load_task_usage(session: Session, task_id: UUID) -> dict:
+    """Report recorded admission once and each Run separately; this is not a budget gate."""
+    # A single statement gives PostgreSQL one snapshot for Task, Runs and executions.
+    rows = session.execute(select(Task.id, Task.admission_usage, Run.id, Run.attempt_number,
+        Run.status, AgentExecution.id, AgentExecution.agent_role, AgentExecution.llm_usage)
+        .select_from(Task).outerjoin(Run, Run.task_id == Task.id)
+        .outerjoin(AgentExecution, AgentExecution.run_id == Run.id)
+        .where(Task.id == task_id).order_by(Run.attempt_number, AgentExecution.id)).all()
+    if not rows:
+        raise UsageReportError("Task does not exist")
+    admission = summarize_usage([("admission", {"model_requests": rows[0][1]})])
+    runs = {}
+    for _, _, run_id, attempt, status, execution_id, role, usage in rows:
+        if run_id is None:
+            continue
+        run = runs.setdefault(run_id, {"attempt_number": attempt, "status": status.value, "executions": []})
+        if execution_id is not None:
+            run["executions"].append((role, usage))
+    reports = [{"run_id": str(run_id), "attempt_number": run["attempt_number"], "status": run["status"],
+                **summarize_usage(run["executions"])} for run_id, run in runs.items()]
+    return {
+        "task_id": str(task_id), "admission": admission, "runs": reports,
+        "recorded_settled_tokens": admission["total_tokens"] + sum(run["total_tokens"] for run in reports),
+        "unsettled_requests": admission["unsettled_requests"] + sum(run["unsettled_requests"] for run in reports),
+        "unknown_usage_executions": sum(run["unknown_usage_executions"] for run in reports),
+        "note": ("Recorded admission and AgentExecution usage only; legacy admission records or other "
+                 "costs may be missing. Unsettled or unknown usage is not included in the settled total. "
+                 "This read-only report reflects one database statement and can become stale; "
+                 "it is not an experiment budget or complete billing statement."),
+    }
+
+
 def compare_usage(first: dict, second: dict) -> dict:
-    """Compare two reports by role, including roles that only one Run used."""
+    """Compare settled usage; never present an incomplete total as a cost difference."""
     first_rows = {row["role"]: row for row in first["roles"]}
     second_rows = {row["role"]: row for row in second["roles"]}
+    def complete(row: dict | None) -> bool:
+        return row is None or (row.get("unsettled_requests") == 0 and
+                               row.get("unknown_usage_executions") == 0)
+
     roles = []
     for role in sorted(set(first_rows) | set(second_rows)):
         before = first_rows.get(role, {}).get("total_tokens", 0)
         after = second_rows.get(role, {}).get("total_tokens", 0)
+        comparable = complete(first_rows.get(role)) and complete(second_rows.get(role))
         roles.append({
             "role": role, "first_tokens": before, "second_tokens": after,
-            "delta": after - before,
-            "change": (None if before == 0 else round((after - before) / before, 4)),
+            "delta": after - before if comparable else None,
+            "change": (None if not comparable or before == 0 else round((after - before) / before, 4)),
         })
     total_before = first["total_tokens"]
     total_after = second["total_tokens"]
+    usage_complete = all(complete(row) for row in (*first_rows.values(), *second_rows.values()))
     return {
         "first_run_id": first["run_id"], "second_run_id": second["run_id"],
         "roles": roles,
         "total": {
             "first_tokens": total_before, "second_tokens": total_after,
-            "delta": total_after - total_before,
-            "change": (None if total_before == 0 else
+            "delta": total_after - total_before if usage_complete else None,
+            "change": (None if not usage_complete or total_before == 0 else
                        round((total_after - total_before) / total_before, 4)),
         },
-        "caveat": ("A smaller second total only says this attempt cost fewer tokens; it does "
-                   "not by itself prove the task went further. Read it together with the "
-                   "record's outcome and stage count."),
+        "recorded_agent_usage_complete": usage_complete,
+        "caveat": ("Totals contain settled AgentExecution usage only and exclude Task admission "
+                   "and other costs; missing or unsettled usage prevents a cost "
+                   "difference. This is a snapshot and a Run may incur later usage. A smaller settled "
+                   "total does not by itself prove the task went further. "
+                   "Read it together with the record's outcome and stage count."),
     }
 
 
 def main(argv: list[str] | None = None, *, session_factory=None) -> int:
     parser = argparse.ArgumentParser(
-        description="Report committed model usage for one Run, optionally comparing two.")
-    parser.add_argument("--run", required=True, help="Run ID to report on.")
+        description="Report recorded model usage for a Task or Run, optionally comparing Runs.")
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--run", help="Run ID to report on.")
+    selection.add_argument("--task", help="Task ID, including recorded admission and all Runs.")
     parser.add_argument("--compare", help="Earlier Run ID; the report then compares both.")
     args = parser.parse_args(argv)
+    if args.task and args.compare:
+        print(json.dumps({"event": "usage_report_configuration_error",
+                          "detail": "--compare requires --run"}), file=sys.stderr)
+        return 2
     try:
-        run_id = UUID(str(args.run))
+        run_id = UUID(str(args.run)) if args.run else None
+        task_id = UUID(str(args.task)) if args.task else None
         compare_id = UUID(str(args.compare)) if args.compare else None
     except (TypeError, ValueError):
         print(json.dumps({"event": "usage_report_configuration_error",
-                          "detail": "Run IDs must be UUIDs"}), file=sys.stderr)
+                          "detail": "Task and Run IDs must be UUIDs"}), file=sys.stderr)
         return 2
 
     engine = None
@@ -143,7 +200,7 @@ def main(argv: list[str] | None = None, *, session_factory=None) -> int:
             engine = create_db_engine()
             session_factory = create_session_factory(engine)
         with session_factory() as session:
-            report = load_run_usage(session, run_id)
+            report = load_task_usage(session, task_id) if task_id else load_run_usage(session, run_id)
             comparison = (compare_usage(load_run_usage(session, compare_id), report)
                           if compare_id is not None else None)
     except UsageReportError as error:
@@ -161,7 +218,7 @@ def main(argv: list[str] | None = None, *, session_factory=None) -> int:
     if comparison is not None:
         print(json.dumps({"event": "run_usage_comparison", **comparison}))
         return 0
-    print(json.dumps({"event": "run_usage", **report}))
+    print(json.dumps({"event": "task_usage" if task_id else "run_usage", **report}))
     return 0
 
 

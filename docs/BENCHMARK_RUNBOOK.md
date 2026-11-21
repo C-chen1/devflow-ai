@@ -56,10 +56,11 @@ python -m devflow_ai.control --take-over-expired-run <RUN_ID> \
 python -m devflow_ai.benchmark_run --pack benchmarks/click_3019_public \
   --task-id <TASK_ID> --operator <姓名> --python-executable <绝对路径解释器> \
   --workspaces-root <dir> --artifacts-root <dir> --record <record.json> \
-  [--policy <快照 JSON>] [--material <可信材料 JSON>] --confirm-run
+  [--policy <快照 JSON>] [--material <可信材料 JSON>] --confirm-run \
+  [--execution-manifest <清单 JSON> --execution-sha256 <独立保存的摘要>]
 ```
 
-`--confirm-run` 是必须的显式确认（会花掉本次预算）；`--policy` 会比对 Task 实际保存的快照与给定文件，任一节（`budget`/`permissions`/`policy_version`）不同即退出 2；入口没有重试参数，一次调用就是一次尝试。未提供材料时告警且正式门禁不会转交，`external_connections=unknown` 时同样告警。退出码 `0` 表示记录已写出（结果看记录 `outcome`），`2` 表示配置不可用、没有开始跑，`1` 表示运行期失败（记录通常已写出）。
+`--execution-manifest`/`--execution-sha256` 可选但必须成对：入口在领取前按独立摘要核验清单所列的包内文件，不符即退出 2 且不创建 Run；核验通过的摘要写进该次 Run（`runs.execution_sha256`），重试/再诊断必须沿用同一摘要。没有提供时该列为 NULL（未知），不会回填。`--confirm-run` 是必须的显式确认（会花掉本次预算）；`--policy` 会比对 Task 实际保存的快照与给定文件，任一节（`budget`/`permissions`/`policy_version`）不同即退出 2；入口没有重试参数，一次调用就是一次尝试。未提供材料时告警且正式门禁不会转交，`external_connections=unknown` 时同样告警。退出码 `0` 表示记录已写出（结果看记录 `outcome`），`2` 表示配置不可用、没有开始跑，`1` 表示运行期失败（记录通常已写出）。
 
 等价的程序化入口 `devflow_ai.benchmark_run.run_one_task` 在一次显式调用里完成装配、领取、执行阶段推进并写运行记录：
 
@@ -74,7 +75,7 @@ result  = run_one_task(request, session_factory=..., worker=...,
                        independent_evaluation=<可信材料或 None>)
 ```
 
-阶段驱动停止后，入口把 Verifier 草稿交给 orchestration 的 `finalize_benchmark_run` 走既有正式评测与完成事务；不提供材料时停在草稿并返回具体原因，不会伪造通过。
+阶段驱动停止后，入口把 Verifier 草稿交给 orchestration 的 `finalize_benchmark_run` 走既有正式评测与完成事务；不提供材料时停在草稿并返回具体原因，不会伪造通过。写出的记录现在带 `attempt_context`：截止是否触发、finalization 是否真的返回过（没有走到就记 `not_recorded`，不会用占位符冒充已发生）、以及观察者来源。
 
 入口会先校验 Task 的 base commit 与清单一致、Task 的 Policy `max_llm_tokens_per_run` 不超过本次 token 上限，任一不符即拒绝启动且不写记录。执行阶段由 orchestration 层的 `run_task_stages` 推进：每轮依据"最后一条已成功的非 Supervisor 执行"选择下一次决策方，并在 Run 离开 RUNNING、执行权被拒、图步数预算耗尽、Supervisor 未派发、该角色之后无对应路由、达到 `max_stages` 或收到停止信号时停止，返回结果里带 `stages` 与 `stopped` 原因。停止不等于失败，也不等于通过——最终结论仍由结果分类与人工审核给出；本入口不做自动重试。
 
@@ -105,6 +106,13 @@ python -m devflow_ai.benchmark_record correct --record <record.json> --reviewed 
 ```
 
 修正副本保留原有人工审核结论，只替换公开/独立摘要，并用 sha256 指向原记录与审核副本；结论不允许被修正改变。
+两份输入必须在 Task / Run、任务包、时间、模型、Policy、结果及正式证据等不可变字段上一致；
+指定的 `--run` 不能与已记录的 Run 不同，若有 Task ID 还要与数据库中的 Run 归属一致。
+重算得到的正式 Verification 和套件版本必须与原记录一致；没有 Run ID 的旧记录只能在可用正式
+Verification 引用能够绑定所选 Run 时修正。缺少这些依据时拒绝，不能凭调用者声明猜测。
+修正引用的 sha256 来自实际解析的输入字节；证据重算期间若检测到输入文件变化或不可读，
+则拒绝写修正副本。汇总也会复核当前字节与已解析记录一致，并拒绝重复传入同一路径。
+这些检查不锁住外部文件，输出之后仍需按摘要保全和核验来源。
 
 审核结论还要落到数据库状态上（记录文件本身不改数据库）：
 
@@ -112,7 +120,7 @@ python -m devflow_ai.benchmark_record correct --record <record.json> --reviewed 
 python -m devflow_ai.task_review --record <record.json> --reviewer <姓名>
 ```
 
-它在**同一事务**里写一条追加式 `task_reviews` 行（绑定 Task、Run、正式 Verification 与记录 sha256），并把 Task 从 `AWAITING_REVIEW` 改为 `COMPLETED`（accepted）或 `REJECTED`（rejected）。同一份记录重复提交是幂等的；换记录或换结论会被拒绝。需要先执行 `alembic upgrade`（迁移 `b7f2c31d8a90`），由可信侧确认后自行执行——本文档不代为迁移。汇总时同一批里可能同时出现原记录、审核副本与修正副本：它们按 `run_id`（缺省用 pack/base/attempt/started_at）归为同一次尝试，默认只计一份（优先未被取代的、再优先修正副本、再优先带人工结论者），其余计入 `superseded_excluded`；同一尝试存在多份修正或无法排序时报 `conflicts` 且不计入样本，不会靠猜。
+它在**同一事务**里写一条追加式 `task_reviews` 行（绑定 Task、Run、正式 Verification 与记录 sha256），并把 Task 从 `AWAITING_REVIEW` 改为 `COMPLETED`（accepted）或 `REJECTED`（rejected）。同一份记录重复提交是幂等的；换记录或换结论会被拒绝。需要先执行 `alembic upgrade`（迁移 `b7f2c31d8a90`），由可信侧确认后自行执行——本文档不代为迁移。汇总时同一批里可能同时出现原记录、审核副本与修正副本：它们按 `run_id`（缺省用 pack/base/attempt/started_at）归为同一次尝试，默认只计一份（优先未被取代的、再优先修正副本、再优先带人工结论者），其余计入 `superseded_excluded`；不可变字段不一致、修正引用了其他尝试、多份修正或无法排序时报 `conflicts`，不把该组计入样本。未提供的来源文件和记录中的验收声明仍需可信侧单独核验；`--include-superseded` 是显式查看所有副本，可能重复计数。
 
 ## 7. 判读与统计
 

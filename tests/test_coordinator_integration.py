@@ -598,3 +598,168 @@ def test_automatic_claim_does_not_hide_invalid_candidate_policy(run_session_fact
     with run_session_factory() as session:
         assert not session.scalars(select(Run)).all()
         assert session.get(Task, task_id).status == TaskStatus.ELIGIBLE
+
+
+def test_an_initial_run_records_the_verified_execution_digest(run_session_factory):
+    task_id = create_eligible_task(run_session_factory)
+    digest = "1" * 64
+    with run_session_factory() as session:
+        run, created = RunCoordinator(session).start_initial_run(
+            task_id, "worker-A", "creation-key", execution_sha256=digest)
+        assert created is True
+        run_id = run.id
+    with run_session_factory() as session:
+        assert session.get(Run, run_id).execution_sha256 == digest
+
+
+def test_rediagnosis_replay_requires_the_original_execution_digest(run_session_factory):
+    from devflow_ai.coordinator import RunVersionConflictError
+
+    task_id = create_eligible_task(run_session_factory)
+    digest = "1" * 64
+    with run_session_factory.begin() as session:
+        now = get_database_time(session)
+        run = Run(task_id=task_id, attempt_number=2, status=RunStatus.RUNNING,
+                  creation_idempotency_key="resume-key", worker_id="worker-A",
+                  recovery_action="REDIAGNOSE", execution_sha256=digest,
+                  lease_expires_at=now + timedelta(minutes=5))
+        session.add(run)
+        session.flush()
+        run_id = run.id
+    for requested in (None, "2" * 64):
+        with run_session_factory() as session:
+            with pytest.raises(RunVersionConflictError):
+                RunCoordinator(session).start_rediagnosis_run(
+                    task_id, "worker-A", "resume-key", execution_sha256=requested)
+    with run_session_factory() as session:
+        run, created = RunCoordinator(session).start_rediagnosis_run(
+            task_id, "worker-A", "resume-key", execution_sha256=digest)
+        assert not created and run.id == run_id
+
+
+def test_an_unknown_execution_digest_is_recorded_as_null(run_session_factory):
+    task_id = create_eligible_task(run_session_factory)
+    with run_session_factory() as session:
+        run, _ = RunCoordinator(session).start_initial_run(task_id, "worker-A", "creation-key")
+        run_id = run.id
+    with run_session_factory() as session:
+        # No manifest was pinned: the Run says so instead of inventing a version.
+        assert session.get(Run, run_id).execution_sha256 is None
+
+
+def test_a_malformed_execution_digest_is_refused_before_any_run_exists(run_session_factory):
+    task_id = create_eligible_task(run_session_factory)
+    with run_session_factory() as session:
+        with pytest.raises(ValueError, match="execution_sha256"):
+            RunCoordinator(session).start_initial_run(
+                task_id, "worker-A", "creation-key", execution_sha256="not-a-digest")
+    with run_session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(Run)) == 0
+
+
+def test_the_database_refuses_a_malformed_execution_digest(run_session_factory):
+    task_id = create_eligible_task(run_session_factory)
+    with run_session_factory() as session:
+        now = get_database_time(session)
+    with pytest.raises(IntegrityError):
+        with run_session_factory.begin() as session:
+            session.add(Run(
+                task_id=task_id, attempt_number=1, status=RunStatus.RUNNING,
+                creation_idempotency_key="fixture", worker_id="worker-A",
+                lease_expires_at=now + timedelta(minutes=5),
+                execution_sha256="NOT-A-DIGEST"))
+            session.flush()
+
+
+@pytest.mark.parametrize(
+    ("history", "requested", "expected", "refused"),
+    [
+        # An entirely unknown history may be pinned from here on.
+        ([None, None], "1" * 64, "1" * 64, False),
+        ([None], None, None, False),
+        # A pinned history accepts the same digest and nothing else.
+        (["1" * 64, None], "1" * 64, "1" * 64, False),
+        (["1" * 64], None, None, True),
+        (["1" * 64], "2" * 64, None, True),
+        # A history that already mixes versions cannot continue at all.
+        (["1" * 64, "2" * 64], "1" * 64, None, True),
+    ],
+)
+def test_a_later_attempt_must_reuse_the_tasks_pinned_version(
+        history, requested, expected, refused):
+    from types import SimpleNamespace
+
+    from devflow_ai.coordinator import RunVersionConflictError, _run_version_for_new_attempt
+
+    runs = [SimpleNamespace(execution_sha256=value) for value in history]
+    if refused:
+        with pytest.raises(RunVersionConflictError):
+            _run_version_for_new_attempt(runs, requested)
+        return
+    assert _run_version_for_new_attempt(runs, requested) == expected
+
+
+def test_two_tasks_can_run_under_different_execution_versions(run_session_factory):
+    """Per-Task pinning: a new Task may use another version, an existing one may not switch."""
+    first_task = create_eligible_task(run_session_factory)
+    second_task = create_eligible_task(run_session_factory)
+    with run_session_factory() as session:
+        first_run, _ = RunCoordinator(session).start_initial_run(
+            first_task, "worker-A", "creation-a", execution_sha256="1" * 64)
+        first_id = first_run.id
+    with run_session_factory() as session:
+        second_run, _ = RunCoordinator(session).start_initial_run(
+            second_task, "worker-A", "creation-b", execution_sha256="2" * 64)
+        second_id = second_run.id
+    with run_session_factory() as session:
+        assert session.get(Run, first_id).execution_sha256 == "1" * 64
+        assert session.get(Run, second_id).execution_sha256 == "2" * 64
+
+
+def test_an_initial_replay_must_use_the_recorded_execution_version(run_session_factory):
+    from devflow_ai.coordinator import RunVersionConflictError
+
+    task_id = create_eligible_task(run_session_factory)
+    with run_session_factory() as session:
+        run, created = RunCoordinator(session).start_initial_run(
+            task_id, "worker-A", "creation-key", execution_sha256="1" * 64)
+        assert created is True
+        run_id = run.id
+    with run_session_factory() as session:
+        same, created = RunCoordinator(session).start_initial_run(
+            task_id, "worker-A", "creation-key", execution_sha256="1" * 64)
+        assert created is False and same.id == run_id
+    with run_session_factory() as session:
+        with pytest.raises(RunVersionConflictError, match="different execution version"):
+            RunCoordinator(session).start_initial_run(
+                task_id, "worker-A", "creation-key", execution_sha256="2" * 64)
+    with run_session_factory() as session:
+        # Reporting a pinned Run as "the same claim" while verifying nothing is refused too.
+        with pytest.raises(RunVersionConflictError):
+            RunCoordinator(session).start_initial_run(
+                task_id, "worker-A", "creation-key")
+    with run_session_factory() as session:
+        assert session.get(Run, run_id).execution_sha256 == "1" * 64
+
+
+def test_a_retry_replay_must_use_the_recorded_execution_version(run_session_factory):
+    from devflow_ai.coordinator import RunVersionConflictError
+
+    task_id = create_eligible_task(run_session_factory)
+    with run_session_factory() as session:
+        now = get_database_time(session)
+    with run_session_factory.begin() as session:
+        session.add(Run(
+            task_id=task_id, attempt_number=2, status=RunStatus.RUNNING,
+            creation_idempotency_key="retry-key", worker_id="worker-A",
+            recovery_action="REVISE_IMPLEMENTATION",
+            lease_expires_at=now + timedelta(minutes=5),
+            execution_sha256="1" * 64))
+    with run_session_factory() as session:
+        run, created = RunCoordinator(session).start_retry_run(
+            task_id, "worker-A", "retry-key", execution_sha256="1" * 64)
+        assert created is False and run.attempt_number == 2
+    with run_session_factory() as session:
+        with pytest.raises(RunVersionConflictError, match="A retry resume"):
+            RunCoordinator(session).start_retry_run(
+                task_id, "worker-A", "retry-key", execution_sha256="2" * 64)

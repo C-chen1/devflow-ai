@@ -713,6 +713,56 @@ def test_a_rehearsal_benchmark_attempt_never_finalizes(
     assert "finalization=skipped" in written["notes"]
 
 
+def test_benchmark_rejects_changed_pinned_scope_before_claim(worker_session_factory, tmp_path, monkeypatch):
+    from devflow_ai.benchmark_run import BenchmarkRunError, BenchmarkRunRequest, run_one_task
+    from devflow_ai.task_pack import load_manifest, scope_evidence_sha256
+
+    factory = worker_session_factory
+    registered = _Registered(tmp_path, factory, monkeypatch, "a")
+    manifest = load_manifest(registered.pack)
+    with factory.begin() as session:
+        session.get(Task, registered.task_id).admission_record = {"reason": "fixture", "evidence": [
+            f"pack:{manifest.pack_id}", f"scope-sha256-v1:{scope_evidence_sha256(manifest.scope)}"]}
+    path = registered.pack / "task.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["scope"]["allowed_paths"] = ["elsewhere/"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    for name in ("workspaces", "artifacts"):
+        (tmp_path / name).mkdir(exist_ok=True)
+    request = BenchmarkRunRequest(pack_dir=registered.pack, task_id=registered.task_id,
+        operator="operator-a", python_executable=sys.executable,
+        workspaces_root=tmp_path / "workspaces", artifacts_root=tmp_path / "artifacts",
+        record_path=tmp_path / "record.json", attempt_kind="rehearsal")
+    with pytest.raises(BenchmarkRunError, match="scope binding"):
+        run_one_task(request, session_factory=factory, worker=Worker(factory, "benchmark-worker"),
+                     gateways=None, heartbeat_config=_heartbeat())
+    with factory() as session:
+        assert session.scalar(select(Run.id).where(Run.task_id == registered.task_id)) is None
+
+
+def test_benchmark_rechecks_admission_at_claim(worker_session_factory, tmp_path, monkeypatch):
+    from devflow_ai.benchmark_run import BenchmarkRunError, BenchmarkRunRequest, run_one_task
+    factory = worker_session_factory
+    registered = _Registered(tmp_path, factory, monkeypatch, "a")
+    for name in ("workspaces", "artifacts"):
+        (tmp_path / name).mkdir(exist_ok=True)
+    request = BenchmarkRunRequest(pack_dir=registered.pack, task_id=registered.task_id,
+        operator="operator-a", python_executable=sys.executable,
+        workspaces_root=tmp_path / "workspaces", artifacts_root=tmp_path / "artifacts",
+        record_path=tmp_path / "record.json", attempt_kind="rehearsal")
+    original = RunCoordinator.start_initial_run
+    def change_before_claim(self, *args, **kwargs):
+        with factory.begin() as other:
+            other.get(Task, registered.task_id).admission_record = {"reason": "changed", "evidence": []}
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(RunCoordinator, "start_initial_run", change_before_claim)
+    with pytest.raises(BenchmarkRunError, match="admission record changed"):
+        run_one_task(request, session_factory=factory, worker=Worker(factory, "benchmark-worker"),
+                     gateways=None, heartbeat_config=_heartbeat())
+    with factory() as session:
+        assert session.scalar(select(Run.id).where(Run.task_id == registered.task_id)) is None
+
+
 # --- the same placement rule for both entries ------------------------------------------
 
 def _pin_pack_material(pack, material_path):

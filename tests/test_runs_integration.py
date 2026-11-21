@@ -911,6 +911,9 @@ def test_run_migration_roundtrip_preserves_tasks_and_recreates_enum(run_session_
     revision = load_run_migration()
     recovery_revision = load_run_migration("e7a1c4d9b2f0_add_run_recovery_action.py")
     start_revision = load_run_migration("f3b8d2a6c1e4_add_run_recovery_start.py")
+    # The execution-version column lives in its own revision; the roundtrip re-applies every
+    # revision that shapes this table, so the column set can still be compared with the model.
+    version_revision = load_run_migration("e2f5b8c41d07_add_run_execution_sha256.py")
     with engine.begin() as connection:
         connection.execute(text(f'SET LOCAL search_path TO "{schema}", public'))
         context = MigrationContext.configure(connection)
@@ -923,6 +926,7 @@ def test_run_migration_roundtrip_preserves_tasks_and_recreates_enum(run_session_
             revision.upgrade()
             recovery_revision.upgrade()
             start_revision.upgrade()
+            version_revision.upgrade()
         inspector = inspect(connection)
         assert {column["name"] for column in inspector.get_columns("runs", schema=schema)} == set(Run.__table__.columns.keys())
         enum = next(item for item in inspector.get_enums(schema=schema) if item["name"] == "run_status")

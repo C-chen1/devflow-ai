@@ -20,7 +20,7 @@ from pydantic import ValidationError
 from devflow_ai.enums import AgentRole, TaskStatus
 from devflow_ai.policy import PolicyConfig
 from devflow_ai.services import AdmissionRecord, TaskService
-from devflow_ai.task_pack import TaskPackManifest, load_manifest
+from devflow_ai.task_pack import TaskPackManifest, load_manifest, scope_evidence_sha256
 
 DEFAULT_MAX_DURATION_SECONDS = 1200
 DEFAULT_MAX_MODEL_TOKENS = 80_000
@@ -114,7 +114,8 @@ def create_benchmark_task(
             task_id, TaskStatus.ELIGIBLE, base_commit=manifest.base_commit,
             admission_record=AdmissionRecord(
                 reason=f"benchmark pack {manifest.pack_id} admitted by {operator}",
-                evidence=[f"pack:{manifest.pack_id}", "policy_snapshot:reviewed"]))
+                evidence=[f"pack:{manifest.pack_id}", "policy_snapshot:reviewed",
+                          f"scope-sha256-v1:{scope_evidence_sha256(manifest.scope)}"]))
     return task_id
 
 

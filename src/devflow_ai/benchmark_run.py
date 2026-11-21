@@ -20,6 +20,7 @@ from hashlib import sha256
 import json
 import os
 import sys
+from copy import deepcopy
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -32,12 +33,13 @@ from sqlalchemy import select
 
 from devflow_ai.benchmark_task import BenchmarkTaskError, load_policy_snapshot
 from devflow_ai.benchmark_record import (
-    SCHEMA_VERSION, AttemptKind, BenchmarkRunRecord, FormalEvidence, HumanReview,
-    IndependentEvaluationEvidence, PublicCheckSummary, RunOutcome, write_run_record,
+    SCHEMA_VERSION, AttemptContext, AttemptKind, BenchmarkRunRecord, FormalEvidence,
+    HumanReview, IndependentEvaluationEvidence, PublicCheckSummary, RunOutcome, write_run_record,
 )
 from devflow_ai.config import HeartbeatConfig
 from devflow_ai.coordinator import RunCoordinator
 from devflow_ai.database import create_db_engine, create_session_factory
+from devflow_ai.execution_binding import ExecutionBindingError, verify_optional_binding
 from devflow_ai.independent_evaluation import (
     IndependentEvaluationMaterial, MaterialPlacementError, PrivateCase,
     require_material_placement,
@@ -51,7 +53,7 @@ from devflow_ai.harness import GitExecutionCancelledError
 from devflow_ai.models import AgentExecution, Artifact, Run, Task, Verification
 from devflow_ai.orchestration import drive_run_stages, finalize_benchmark_run
 from devflow_ai.policy import PolicyConfig
-from devflow_ai.task_pack import load_manifest, to_verification_config
+from devflow_ai.task_pack import load_manifest, optional_scope_binding_matches, to_verification_config
 from devflow_ai.verifier import (
     VerificationEvidenceError, load_independent_evaluation, load_semantic_review_draft,
     preliminary_public_outcome,
@@ -97,6 +99,10 @@ class BenchmarkRunRequest:
     # A rehearsal proves the environment works; it is not a formal sample and must never
     # be counted as one. The marker lands in the record's notes so summaries can exclude it.
     attempt_kind: str = "formal"
+    # Pinned execution inventory for the code this entry runs. Verified before the claim; the
+    # verified digest is written to the Run in the claim transaction. Both or neither.
+    execution_manifest: Path | None = None
+    execution_sha256: str | None = None
     limits: BenchmarkLimits = field(default_factory=BenchmarkLimits)
 
 
@@ -394,8 +400,8 @@ def compose_run_record(
     session, run_id, *, manifest, task_id, independent_suite_version: str | None,
     policy_version: str, operator: str, attempt_kind: AttemptKind, artifact_root: Path,
     finalization: dict | None, deadline_fired: bool, artifacts_root: Path, started_at: str,
-    limits: BenchmarkLimits | None = None, model_id: str | None = None,
-    attempt_index: int = 1, finished_at: str | None = None,
+    attempt_context: AttemptContext, limits: BenchmarkLimits | None = None,
+    model_id: str | None = None, attempt_index: int = 1, finished_at: str | None = None,
     error: BaseException | None = None, entered_execution: bool = True,
     stage_notes: str = "", extra_notes: str = "",
 ) -> tuple[BenchmarkRunRecord, str, bool]:
@@ -406,6 +412,11 @@ def compose_run_record(
     trusted chain, ``failed`` only with a verified calibrated failure, ``timeout`` when the
     deadline fired, and ``incomplete`` for everything a reader could not confirm. A human
     decision is never filled in here — the record is what a reviewer is asked to read.
+
+    ``attempt_context`` is what the caller observed about the attempt's end conditions. It is
+    required and never inferred here: a caller that only has persisted rows passes
+    ``AttemptContext.unknown(...)``, so the record states that the deadline and the
+    finalization step were not recovered instead of writing "not fired" for them.
 
     Callers that only have persisted rows (a backfill of an earlier Run) pass no limits and no
     model: the record then says those facts were not recovered instead of guessing them.
@@ -445,6 +456,7 @@ def compose_run_record(
         human_review=HumanReview(),
         artifacts=(str(artifacts_root / str(run_id)),),
         attempt_kind=attempt_kind,
+        attempt_context=attempt_context,
         notes=(limits_note
                + (f", reason={reason}" if reason else "")
                + stage_notes
@@ -453,6 +465,16 @@ def compose_run_record(
                   if finalization else "")
                + extra_notes))
     return record, reason, deadline_cancelled
+
+
+def _verified_execution_sha256(request: BenchmarkRunRequest) -> str | None:
+    """Verify the pinned execution manifest before the Task is claimed."""
+    try:
+        return verify_optional_binding(
+            manifest_path=request.execution_manifest,
+            expected_sha256=request.execution_sha256, require_complete=True)
+    except ExecutionBindingError as error:
+        raise BenchmarkRunError(f"Execution binding refused: {error}") from None
 
 
 def run_one_task(
@@ -481,6 +503,9 @@ def run_one_task(
             raise BenchmarkRunError("Task does not exist")
         if task.base_commit != manifest.base_commit:
             raise BenchmarkRunError("Task base commit does not match the task pack")
+        if not optional_scope_binding_matches(task.admission_record, manifest):
+            raise BenchmarkRunError("Task scope binding does not match the task pack")
+        admission_snapshot = deepcopy(task.admission_record)
         if request.material_path is not None:
             # Same rule as the worker entry, and it runs before the claim: the material must
             # not sit in the pack, the Run's roots, or a local checkout of this Task's repo.
@@ -496,17 +521,25 @@ def run_one_task(
             raise BenchmarkRunError(
                 "Task policy allows more tokens than this run's limit; refusing to start")
 
+    execution_sha256 = _verified_execution_sha256(request)
     claim_key = f"benchmark:{request.task_id}:1"
     with session_factory() as session:
-        run, created = RunCoordinator(session).start_initial_run(
-            request.task_id, worker.worker_id, claim_key)
+        try:
+            run, created = RunCoordinator(session).start_initial_run(
+                request.task_id, worker.worker_id, claim_key,
+                expected_base_commit=manifest.base_commit, check_admission_record=True,
+                expected_admission_record=admission_snapshot,
+                execution_sha256=execution_sha256)
+        except (ValueError, LookupError) as error:
+            raise BenchmarkRunError(str(error) or "The Task cannot be claimed") from None
         run_id = run.id
         run_task_id = run.task_id
     if run_task_id != request.task_id:
         raise BenchmarkRunError("Claimed Run belongs to a different Task")
     if not created:
         # Same request, same attempt: re-running would be an automatic retry.
-        return {"outcome": "existing_run", "run_id": str(run_id), "record_path": None}
+        return {"outcome": "existing_run", "run_id": str(run_id), "record_path": None,
+                "execution_sha256": execution_sha256}
     started_at = _now()
     fired = {"deadline": False}
     entered = {"execution": False}
@@ -568,7 +601,9 @@ def run_one_task(
         worker.execute_run(
             run_id, workspaces_root=request.workspaces_root,
             artifacts_root=request.artifacts_root, heartbeat_config=heartbeat_config,
-            process_run=process, external_stop_event=deadline_stop)
+            process_run=process, external_stop_event=deadline_stop,
+            execution_manifest=request.execution_manifest,
+            execution_sha256=execution_sha256)
     except Exception as caught:  # recorded below, then re-raised unchanged
         error = caught
     finally:
@@ -576,8 +611,10 @@ def run_one_task(
         deadline_fired = fired["deadline"]
 
     # A stage loop that never started a finalize call still reports why no formal
-    # result was attempted.
-    finalization = stage_result.get("finalization") or {
+    # result was attempted. That placeholder describes the absence for the classifier; the
+    # attempt context records the absence itself, not a step that ran.
+    observed_finalization = stage_result.get("finalization")
+    finalization = observed_finalization or {
         "outcome": "skipped",
         "reason": "not_attempted" if error is None else "execution_error"}
 
@@ -588,6 +625,9 @@ def run_one_task(
             policy_version=policy.policy_version, operator=request.operator,
             attempt_kind=attempt_kind, artifact_root=request.artifacts_root / str(run_id),
             finalization=finalization, deadline_fired=deadline_fired,
+            attempt_context=AttemptContext.observed(
+                deadline_fired=deadline_fired, finalization=observed_finalization,
+                execution_sha256=execution_sha256, source="benchmark_attempt"),
             artifacts_root=request.artifacts_root, started_at=started_at,
             limits=request.limits, error=error,
             entered_execution=entered["execution"],
@@ -598,6 +638,7 @@ def run_one_task(
         raise error
     return {"outcome": record.outcome.value, "run_id": str(run_id),
             "record_path": str(request.record_path), "deadline_fired": deadline_fired,
+            "execution_sha256": execution_sha256,
             "attempt_kind": attempt_kind.value,
             "reason": reason, "stages": stage_result.get("stages"),
             "stopped": stage_result.get("reason"), "finalization": finalization}
@@ -742,6 +783,14 @@ def main(
     parser.add_argument("--attempt-kind", choices=["formal", "rehearsal"], default="formal",
                         help="'rehearsal' marks an environment check; summaries exclude it by "
                              "default so a rehearsal never enters the formal sample.")
+    parser.add_argument("--execution-manifest",
+                        help="Pinned file inventory for the code this entry runs (JSON from "
+                             "`python -m devflow_ai.execution_manifest create`). Verified "
+                             "against the running package before the Task is claimed.")
+    parser.add_argument("--execution-sha256",
+                        help="The pinned manifest digest, kept separately from the manifest "
+                             "file. Supplied together with --execution-manifest; the verified "
+                             "digest is written to the Run.")
     parser.add_argument("--confirm-run", action="store_true",
                         help="Required: acknowledges that this spends the pinned budget on a real run.")
     args = parser.parse_args(argv)
@@ -814,7 +863,10 @@ def main(
         python_executable=args.python_executable,
         workspaces_root=Path(args.workspaces_root), artifacts_root=Path(args.artifacts_root),
         record_path=Path(args.record), attempt_kind=args.attempt_kind,
-        material_path=Path(args.material) if args.material else None)
+        material_path=Path(args.material) if args.material else None,
+        execution_manifest=(Path(args.execution_manifest)
+                            if args.execution_manifest else None),
+        execution_sha256=args.execution_sha256)
     engine = None
     try:
         if session_factory is None:

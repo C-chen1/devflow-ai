@@ -5,11 +5,12 @@ from pydantic import ValidationError
 
 from contextlib import nullcontext
 from hashlib import sha256
+from types import SimpleNamespace
 from uuid import uuid4
 
 from devflow_ai.benchmark_record import (
-    AttemptKind, BenchmarkRunRecord, FormalEvidence, RunOutcome, load_run_record,
-    summarize_run_records, write_run_record,
+    AttemptContext, AttemptKind, BenchmarkRunRecord, FormalEvidence, RunOutcome,
+    load_run_record, summarize_run_records, write_run_record,
 )
 from devflow_ai.benchmark_record import main as record_main
 
@@ -410,6 +411,162 @@ def test_a_correction_cannot_retarget_another_attempt(tmp_path):
             corrects_sha256="0" * 64, reviewed_sha256="1" * 64)
 
 
+def test_a_correction_rejects_different_run_and_task_ids(tmp_path):
+    from devflow_ai.benchmark_record import corrected_record
+    first_run, second_run, task_id = str(uuid4()), str(uuid4()), str(uuid4())
+    original = _pending_record(tmp_path, run_id=first_run, task_id=task_id)
+    decision = _repaired_decision()
+    for reviewed in (_reviewed_copy(run_id=second_run, task_id=task_id),
+                     _reviewed_copy(run_id=first_run, task_id=str(uuid4()))):
+        with pytest.raises(ValueError, match="run_id|task_id"):
+            corrected_record(load_run_record(original), reviewed, public_checks=decision.public_checks,
+                independent=decision.independent, basis="b", corrected_by="reviewer-b",
+                corrected_at="2026-11-12T12:00:00+00:00", corrects_sha256="0" * 64,
+                reviewed_sha256="1" * 64)
+
+
+def test_correction_refuses_explicit_other_run_before_querying(tmp_path, monkeypatch, capsys):
+    import devflow_ai.benchmark_run as benchmark_run_module
+    selected, other = str(uuid4()), str(uuid4())
+    original = _pending_record(tmp_path, run_id=selected)
+    reviewed = write_run_record(_reviewed_copy(run_id=selected), tmp_path / "reviewed.json")
+    queried = []
+    monkeypatch.setattr(benchmark_run_module, "classify_outcome",
+                        lambda *args, **kwargs: queried.append(True) or _repaired_decision())
+    out = tmp_path / "corrected.json"
+    assert record_main(["correct", "--record", str(original), "--reviewed", str(reviewed),
+        "--out", str(out), "--run", other, "--artifacts-root", str(tmp_path),
+        "--basis", "b", "--corrected-by", "reviewer", "--at", "2026-11-12T12:00:00+00:00"],
+        session_factory=lambda: nullcontext(None)) == 2
+    assert not queried and not out.exists()
+    assert "run_id" in capsys.readouterr().err
+
+
+def test_correction_rejects_task_mismatch_with_database_run(tmp_path, monkeypatch, capsys):
+    import devflow_ai.benchmark_run as benchmark_run_module
+    run_id, task_id = uuid4(), uuid4()
+    original = _pending_record(tmp_path, run_id=str(run_id), task_id=str(task_id))
+    reviewed = write_run_record(_reviewed_copy(run_id=str(run_id), task_id=str(task_id)), tmp_path / "reviewed.json")
+    queried = []
+    monkeypatch.setattr(benchmark_run_module, "classify_outcome",
+                        lambda *args, **kwargs: queried.append(True) or _repaired_decision())
+    session = SimpleNamespace(get=lambda model, selected: SimpleNamespace(task_id=uuid4()))
+    assert record_main(["correct", "--record", str(original), "--reviewed", str(reviewed),
+        "--out", str(tmp_path / "out.json"), "--artifacts-root", str(tmp_path), "--basis", "b",
+        "--corrected-by", "reviewer", "--at", "2026-11-12T12:00:00+00:00"],
+        session_factory=lambda: nullcontext(session)) == 2
+    assert not queried and "task_id" in capsys.readouterr().err
+
+
+def test_correction_checks_task_run_binding_in_postgresql(run_session_factory, tmp_path, monkeypatch, capsys):
+    import devflow_ai.benchmark_run as benchmark_run_module
+    from devflow_ai.enums import TaskStatus
+    from devflow_ai.services import AdmissionRecord, TaskService
+    from devflow_ai.worker import Worker
+
+    factory = run_session_factory
+    with factory() as session:
+        task, _ = TaskService(session).create_task(title="fixture", description="fixture", repo="fixture",
+                                                   idempotency_key=uuid4())
+        task_id = task.id
+    with factory() as session:
+        TaskService(session).apply_admission_decision(task_id, TaskStatus.ELIGIBLE, base_commit="a" * 40,
+            admission_record=AdmissionRecord(reason="fixture", evidence=["fixture"]))
+    run_id = Worker(factory, "correction-binding-worker").claim_once().run_id
+    declared_other_task = str(uuid4())
+    original = _pending_record(tmp_path, run_id=str(run_id), task_id=declared_other_task)
+    reviewed = write_run_record(_reviewed_copy(run_id=str(run_id), task_id=declared_other_task),
+                                tmp_path / "reviewed.json")
+    queried = []
+    monkeypatch.setattr(benchmark_run_module, "classify_outcome",
+                        lambda *args, **kwargs: queried.append(True) or _repaired_decision())
+    assert record_main(["correct", "--record", str(original), "--reviewed", str(reviewed),
+        "--out", str(tmp_path / "out.json"), "--artifacts-root", str(tmp_path), "--basis", "b",
+        "--corrected-by", "reviewer", "--at", "2026-11-12T12:00:00+00:00"], session_factory=factory) == 2
+    assert not queried and "task_id" in capsys.readouterr().err
+
+
+def test_correction_rejects_different_formal_verification(tmp_path, monkeypatch, capsys):
+    import devflow_ai.benchmark_run as benchmark_run_module
+    from dataclasses import replace
+    original = _pending_record(tmp_path)
+    reviewed = write_run_record(_reviewed_copy(), tmp_path / "reviewed.json")
+    wrong = replace(_repaired_decision(), formal=FormalEvidence(
+        verification_id="other-verification", independent_suite_version="suite-1"))
+    monkeypatch.setattr(benchmark_run_module, "classify_outcome", lambda *args, **kwargs: wrong)
+    assert record_main(["correct", "--record", str(original), "--reviewed", str(reviewed),
+        "--out", str(tmp_path / "out.json"), "--run", str(uuid4()), "--artifacts-root", str(tmp_path),
+        "--basis", "b", "--corrected-by", "reviewer", "--at", "2026-11-12T12:00:00+00:00"],
+        session_factory=lambda: nullcontext(None)) == 2
+    assert "formal verification" in capsys.readouterr().err
+
+
+def test_correction_refuses_source_changed_during_evidence_lookup(tmp_path, monkeypatch, capsys):
+    import devflow_ai.benchmark_run as benchmark_run_module
+    original = _pending_record(tmp_path)
+    reviewed = write_run_record(_reviewed_copy(), tmp_path / "reviewed.json")
+    out = tmp_path / "corrected.json"
+    def classify(*args, **kwargs):
+        payload = json.loads(original.read_bytes())
+        payload["model_id"] = "changed-after-load"
+        original.write_text(json.dumps(payload), encoding="utf-8")
+        return _repaired_decision()
+    monkeypatch.setattr(benchmark_run_module, "classify_outcome", classify)
+    assert record_main(["correct", "--record", str(original), "--reviewed", str(reviewed),
+        "--out", str(out), "--run", str(uuid4()), "--artifacts-root", str(tmp_path),
+        "--basis", "b", "--corrected-by", "reviewer", "--at", "2026-11-12T12:00:00+00:00"],
+        session_factory=lambda: nullcontext(None)) == 2
+    assert not out.exists() and "changed during correction" in capsys.readouterr().err
+
+
+def test_summarize_refuses_record_changed_after_parse(tmp_path, monkeypatch, capsys):
+    import devflow_ai.benchmark_record as module
+    path = write_run_record(BenchmarkRunRecord.model_validate(_record()), tmp_path / "record.json")
+    original_load = module.load_run_record
+    def load_then_change(selected):
+        result = original_load(selected)
+        payload = json.loads(path.read_bytes())
+        payload["model_id"] = "changed-after-load"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return result
+    monkeypatch.setattr(module, "load_run_record", load_then_change)
+    assert record_main(["summarize", str(path)]) == 1
+    assert "run_record_unreadable" in capsys.readouterr().err
+
+
+def test_summarize_refuses_repeated_record_path(tmp_path, capsys):
+    path = write_run_record(BenchmarkRunRecord.model_validate(_record()), tmp_path / "record.json")
+    assert record_main(["summarize", str(path), str(path)]) == 1
+    assert "run_record_unreadable" in capsys.readouterr().err
+
+
+def test_correction_records_digest_of_exact_parsed_bytes(tmp_path, monkeypatch):
+    import devflow_ai.benchmark_run as benchmark_run_module
+    original = _pending_record(tmp_path)
+    reviewed = write_run_record(_reviewed_copy(), tmp_path / "reviewed.json")
+    original_bytes, reviewed_bytes = original.read_bytes(), reviewed.read_bytes()
+    monkeypatch.setattr(benchmark_run_module, "classify_outcome", lambda *args, **kwargs: _repaired_decision())
+    out = tmp_path / "corrected.json"
+    assert record_main(["correct", "--record", str(original), "--reviewed", str(reviewed),
+        "--out", str(out), "--run", str(uuid4()), "--artifacts-root", str(tmp_path),
+        "--basis", "b", "--corrected-by", "reviewer", "--at", "2026-11-12T12:00:00+00:00"],
+        session_factory=lambda: nullcontext(None)) == 0
+    record = load_run_record(out)
+    assert record.correction.corrects_sha256 == sha256(original_bytes).hexdigest()
+    assert record.correction.reviewed_sha256 == sha256(reviewed_bytes).hexdigest()
+
+
+def test_correction_cannot_bind_unidentified_nonformal_legacy_record(tmp_path, capsys):
+    original = _pending_record(tmp_path, outcome="incomplete", formal=None, artifacts=[])
+    reviewed = write_run_record(_reviewed_copy(outcome="incomplete", formal=None, artifacts=[]),
+                                tmp_path / "reviewed.json")
+    assert record_main(["correct", "--record", str(original), "--reviewed", str(reviewed),
+        "--out", str(tmp_path / "out.json"), "--run", str(uuid4()), "--artifacts-root", str(tmp_path),
+        "--basis", "b", "--corrected-by", "reviewer", "--at", "2026-11-12T12:00:00+00:00"],
+        session_factory=lambda: nullcontext(None)) == 2
+    assert "needs formal verification" in capsys.readouterr().err
+
+
 def test_the_cli_writes_a_correction_and_leaves_both_inputs_untouched(
     tmp_path, monkeypatch, capsys,
 ):
@@ -517,8 +674,9 @@ def test_the_correction_can_read_the_run_id_from_the_record(tmp_path, monkeypatc
     import devflow_ai.benchmark_run as benchmark_run_module
 
     run_id = uuid4()
-    original = _pending_record(tmp_path, run_id=str(run_id), task_id=str(uuid4()))
-    reviewed = write_run_record(_reviewed_copy(run_id=str(run_id)), tmp_path / "reviewed.json")
+    task_id = uuid4()
+    original = _pending_record(tmp_path, run_id=str(run_id), task_id=str(task_id))
+    reviewed = write_run_record(_reviewed_copy(run_id=str(run_id), task_id=str(task_id)), tmp_path / "reviewed.json")
     captured = {}
 
     def classify(session, selected_run_id, **kwargs):
@@ -532,7 +690,7 @@ def test_the_correction_can_read_the_run_id_from_the_record(tmp_path, monkeypatc
         "--out", str(tmp_path / "corrected.json"), "--artifacts-root", str(tmp_path),
         "--basis", "b", "--corrected-by", "reviewer-b",
         "--at", "2026-11-12T12:00:00+00:00"],
-        session_factory=lambda: nullcontext(None)) == 0
+        session_factory=lambda: nullcontext(SimpleNamespace(get=lambda model, selected: SimpleNamespace(task_id=task_id)))) == 0
     assert captured["run_id"] == run_id
 
 
@@ -558,6 +716,30 @@ def _record_with_correction(tmp_path, *, name, corrects, reviewed_sha, **overrid
                     "corrected_by": "reviewer-b"},
         **overrides)
     return write_run_record(BenchmarkRunRecord.model_validate(payload), tmp_path / name)
+
+
+def test_foreign_correction_cannot_hide_a_different_run(tmp_path):
+    from devflow_ai.benchmark_record import deduplicate_records
+    first_id, second_id = str(uuid4()), str(uuid4())
+    first = write_run_record(BenchmarkRunRecord.model_validate(_record(run_id=first_id)), tmp_path / "first.json")
+    second = write_run_record(BenchmarkRunRecord.model_validate(_record(run_id=second_id)), tmp_path / "second.json")
+    bad = _record_with_correction(tmp_path, name="bad.json", run_id=first_id,
+        corrects=sha256(second.read_bytes()).hexdigest(), reviewed_sha=sha256(first.read_bytes()).hexdigest())
+    records, details = deduplicate_records([(path, load_run_record(path)) for path in (first, second, bad)])
+    assert [record.run_id for record in records] == [second_id]
+    assert details["conflicts_excluded"] == 1
+
+
+def test_reviewed_copy_cannot_hide_conflicting_immutable_fields(tmp_path):
+    from devflow_ai.benchmark_record import deduplicate_records
+    run_id = str(uuid4())
+    original = write_run_record(BenchmarkRunRecord.model_validate(_record(
+        run_id=run_id, human_review={"conclusion": "pending"})), tmp_path / "pending.json")
+    altered = write_run_record(BenchmarkRunRecord.model_validate(_record(
+        run_id=run_id, model_id="different-model")), tmp_path / "reviewed.json")
+    records, details = deduplicate_records([(path, load_run_record(path)) for path in (original, altered)])
+    assert records == []
+    assert details["conflicts_excluded"] == 1
 
 
 def test_an_original_its_review_copy_and_its_correction_count_once(tmp_path, capsys):
@@ -663,3 +845,88 @@ def test_a_corrected_copy_is_written_under_the_current_schema(tmp_path, monkeypa
 
     assert load_run_record(out).schema_version == SCHEMA_VERSION
     assert json.loads(out.read_text(encoding="utf-8"))["schema_version"] == SCHEMA_VERSION
+
+
+def test_an_attempt_context_round_trips_through_a_record(tmp_path):
+    payload = _record(attempt_context={
+        "deadline": "fired", "finalization": "recorded",
+        "finalization_outcome": "not_finalized", "source": "benchmark_attempt"})
+    record = BenchmarkRunRecord.model_validate(payload)
+    path = write_run_record(record, tmp_path / "record.json")
+
+    loaded = load_run_record(path)
+
+    assert loaded.attempt_context is not None
+    assert loaded.attempt_context.deadline == "fired"
+    assert loaded.attempt_context.finalization == "recorded"
+    assert loaded.attempt_context.finalization_outcome == "not_finalized"
+    assert loaded.attempt_context.source == "benchmark_attempt"
+    assert loaded == record
+
+
+def test_a_record_without_an_attempt_context_reads_as_absent_not_as_quiet(tmp_path):
+    path = tmp_path / "legacy.json"
+    path.write_text(json.dumps(_record()), encoding="utf-8")
+
+    record = load_run_record(path)
+
+    # Absent is not "no deadline, no finalization": a reader has to treat it as unknown.
+    assert record.attempt_context is None
+    unknown = AttemptContext.unknown(source="backfill_reconstruction")
+    assert unknown.deadline == "unknown"
+    assert unknown.finalization == "unknown"
+
+
+def test_only_a_recorded_finalization_carries_an_outcome():
+    with pytest.raises(ValidationError):
+        AttemptContext(deadline="fired", finalization="not_recorded",
+                       finalization_outcome="finalized", source="benchmark_attempt")
+
+
+def test_an_attempt_context_can_name_the_execution_version_it_ran(tmp_path):
+    digest = "a" * 64
+    context = AttemptContext.observed(
+        deadline_fired=False, finalization=None, execution_sha256=digest,
+        source="worker_run")
+    assert context.execution_sha256 == digest
+
+    path = write_run_record(BenchmarkRunRecord.model_validate(
+        _record(attempt_context=context.model_dump(mode="json"))),
+        tmp_path / "record.json")
+    assert load_run_record(path).attempt_context.execution_sha256 == digest
+
+    with pytest.raises(ValidationError):
+        AttemptContext(deadline="unknown", finalization="unknown",
+                       execution_sha256="not-a-digest", source="worker_run")
+
+
+def test_a_live_attempt_context_separates_fired_from_recorded():
+    fired = AttemptContext.observed(deadline_fired=True, finalization={"outcome": "finalized"},
+                                    source="benchmark_attempt")
+    assert (fired.deadline, fired.finalization, fired.finalization_outcome) == (
+        "fired", "recorded", "finalized")
+
+    quiet = AttemptContext.observed(deadline_fired=False, finalization=None, source="worker_run")
+    assert (quiet.deadline, quiet.finalization, quiet.finalization_outcome) == (
+        "not_fired", "not_recorded", None)
+
+
+def test_an_older_declared_schema_is_not_reported_as_unversioned(tmp_path):
+    from devflow_ai.benchmark_record import SCHEMA_VERSION
+
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps(_record()), encoding="utf-8")
+    older = tmp_path / "older.json"
+    older.write_text(json.dumps(_record(schema_version=2)), encoding="utf-8")
+    current = tmp_path / "current.json"
+    current.write_text(json.dumps(_record(schema_version=SCHEMA_VERSION)), encoding="utf-8")
+
+    # A file that declares no version reads as version 1; a v2 file declared its version and
+    # must not be counted as unversioned just because this code is newer.
+    assert summarize_run_records(
+        [load_run_record(legacy)])["records_without_schema_version"] == 1
+    summary = summarize_run_records([load_run_record(older)])
+    assert summary["records_without_schema_version"] == 0
+    assert summary["records_below_current_schema"] == 1
+    assert summarize_run_records(
+        [load_run_record(current)])["records_below_current_schema"] == 0

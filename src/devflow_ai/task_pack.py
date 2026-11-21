@@ -15,6 +15,7 @@ trusted control plane provides it are allowed.
 from __future__ import annotations
 
 import argparse
+from hashlib import sha256
 import json
 import sys
 from enum import StrEnum
@@ -64,6 +65,40 @@ class ScopeSpec(BaseModel):
 
     allowed_paths: tuple[str, ...] = Field(min_length=1)
     forbidden_paths: tuple[str, ...] = ()
+
+
+def scope_evidence_sha256(scope: ScopeSpec) -> str:
+    """Digest the explicit scope as encoded in trusted admission evidence, version 1."""
+    payload = {"allowed_paths": list(scope.allowed_paths), "forbidden_paths": list(scope.forbidden_paths)}
+    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def admission_has_scope_digest(admission: object, digest: str) -> bool:
+    """Verify an exact single pack marker and scope declaration; never infer missing values."""
+    if not isinstance(admission, dict) or not isinstance(admission.get("evidence"), list):
+        return False
+    evidence = admission["evidence"]
+    packs = [item for item in evidence if isinstance(item, str) and item.startswith("pack:")]
+    scopes = [item for item in evidence if isinstance(item, str) and item.startswith("scope-sha256-v1:")]
+    return len(packs) == 1 and len(packs[0]) > len("pack:") and scopes == ["scope-sha256-v1:" + digest]
+
+
+def optional_scope_binding_matches(admission: object, manifest: "TaskPackManifest") -> bool:
+    """Compare pinned scope and pack when present; unmarked legacy Tasks remain compatible.
+
+    Absence is not evidence of authenticity: an old Task and a stripped marker cannot be
+    distinguished by this legacy-compatible format.
+    """
+    if not isinstance(admission, dict) or not isinstance(admission.get("evidence"), list):
+        return True
+    evidence = admission["evidence"]
+    scopes = [item for item in evidence if isinstance(item, str) and item.startswith("scope-sha256-v1:")]
+    if not scopes:
+        return True
+    packs = [item for item in evidence if isinstance(item, str) and item.startswith("pack:")]
+    return (packs == [f"pack:{manifest.pack_id}"] and
+            scopes == [f"scope-sha256-v1:{scope_evidence_sha256(manifest.scope)}"])
 
 
 class PublicChecks(BaseModel):
@@ -189,6 +224,7 @@ def to_verification_config(
     return VerificationConfig(
         task_id=task_id,
         base_commit=manifest.base_commit,
+        scope=manifest.scope,
         command_name=manifest.public_checks.command_name,
         command=command,
         python_executable=python_executable,

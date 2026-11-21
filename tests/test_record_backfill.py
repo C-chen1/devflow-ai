@@ -207,6 +207,14 @@ def test_a_verifiable_formal_run_is_backfilled_as_a_formal_pass(
     assert record.task_id == str(task_id) and record.run_id == str(run_id)
     assert record.human_review.conclusion == "pending"
     assert record.policy_version and record.model_id == "unrecorded"
+    # A reconstruction did not see the attempt, so it records that both facts are unknown
+    # rather than writing "no deadline, no finalization".
+    assert record.attempt_context is not None
+    assert record.attempt_context.deadline == "unknown"
+    assert record.attempt_context.finalization == "unknown"
+    assert record.attempt_context.source == "backfill_reconstruction"
+    # The fixture's Run records no execution digest, so the record copies none.
+    assert record.attempt_context.execution_sha256 is None
     # The kind was not recorded anywhere, so the reconstruction does not claim one — and an
     # unknown kind stays out of the formal sample even though the Run passed.
     assert record.attempt_kind is AttemptKind.UNKNOWN

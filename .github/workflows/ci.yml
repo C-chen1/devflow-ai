@@ -33,6 +33,14 @@ jobs:
       DEVFLOW_DB_HOST: 127.0.0.1
       DEVFLOW_DB_PORT: '5432'
       PGTZ: UTC
+      DEVFLOW_LIVE_ADMISSION_TEST: '0'
+      DEVFLOW_LIVE_SUPERVISOR_TEST: '0'
+      DEVFLOW_LIVE_END_TO_END: '0'
+      DEVFLOW_LIVE_CLICK_3019: '0'
+      DEVFLOW_TEST_EVALUATION_CONTAINER: '0'
+      DEVFLOW_CLICK_3019_CHECKOUT: ''
+      DEVFLOW_CLICK3084_BASE_CHECKOUT: ''
+      DEVFLOW_CLICK3084_FIX_CHECKOUT: ''
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -44,9 +52,9 @@ jobs:
         run: uv sync --locked
       # 有意只跑这些文件：它们都是跨平台的，并且不依赖 Windows Job 的 pytest 报告采集。
       # 未包含 tests/test_worker_integration.py 与 tests/test_rediagnosis_recovery_integration.py
-      # （除下面四个可跨平台的用例），因为其中多数可信基线用例需要 Windows Job；
+      # （除下面明确列出的可跨平台用例），因为其中多数可信基线用例需要 Windows Job；
       # 这些用例已在非 Windows 上显式跳过，跳过不计为通过。
-      # 同一集合在 Linux + 隔离 PostgreSQL 上实跑 224 passed；GitHub Runner 上尚未实际触发。
+      # GitHub Runner 上的实际执行结果须以对应工作流运行记录为准。
       - name: Run focused unit and database integration tests
         run: >-
           uv run --locked pytest -p no:cacheprovider -q
@@ -57,6 +65,25 @@ jobs:
           tests/test_planner.py
           tests/test_supervisor.py
           tests/test_verifier.py
+          tests/test_execution_manifest.py
+          tests/test_execution_binding.py
+          tests/test_version_rollback.py
+          tests/test_artifact_launch.py
+          tests/test_worker_artifact_execution.py
+          tests/test_version_launch.py
+          tests/test_experiment.py
+          tests/test_experiment_budget.py
+          tests/test_experiment_db_privileges.py
+          tests/test_experiment_channel_protocol.py
+          tests/test_rsi_demo_flow.py
+          tests/test_experiment_stage_budget.py
+          tests/test_model_gateways.py
+          tests/test_coordinator_integration.py
+          tests/test_memory.py
+          tests/test_memory_migration_chain.py
+          tests/test_usage_report.py
+          tests/test_benchmark_task.py
+          tests/test_task_pack.py
           tests/test_task_review.py
           tests/test_benchmark_record.py
           tests/test_worker_run.py
@@ -64,6 +91,12 @@ jobs:
           tests/test_worker_finalize_chain.py
           tests/test_worker_scheduler_record.py
           tests/test_record_backfill.py
+          tests/test_worker_integration.py::test_registered_check_skill_respects_existing_tool_boundary
+          tests/test_worker_integration.py::test_registered_skill_reuses_same_version_across_isolated_tasks
+          tests/test_worker_integration.py::test_scope_skill_supports_literal_rules_but_not_wildcards
+          tests/test_worker_integration.py::test_skill_identity_is_committed_before_command_failure
+          tests/test_worker_integration.py::test_diff_scope_skill_uses_guarded_diff_and_literal_rules
+          tests/test_worker_integration.py::test_diff_scope_v2_requires_admission_binding_and_rechecks_before_tool
           tests/test_rediagnosis_recovery_integration.py::test_expired_run_derives_escalation_when_the_rediagnosis_quota_is_exhausted
           tests/test_rediagnosis_recovery_integration.py::test_expired_run_close_escalation_blocks_recovery
           tests/test_rediagnosis_recovery_integration.py::test_control_cli_closes_expired_runs_without_starting_recovery

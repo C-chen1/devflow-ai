@@ -9,6 +9,8 @@ from devflow_ai.coder import CoderOutput, PatchReady
 from devflow_ai.models import AgentExecution, Artifact, FailureRecord, Handoff, Run, Task, ToolCall, Verification
 from devflow_ai.planner import PlanReady, PlannerOutput
 
+MEMORY_RECALL_CONTEXT_KEY = "memory_recall_v1"
+
 
 class AgentReadEvidenceError(ValueError):
     """The submitted reference does not match an eligible read in this execution."""

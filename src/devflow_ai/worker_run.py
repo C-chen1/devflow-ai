@@ -25,6 +25,7 @@ import json
 import os
 import signal
 import sys
+from copy import deepcopy
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,7 +34,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import select
 
-from devflow_ai.benchmark_record import AttemptKind
+from devflow_ai.benchmark_record import AttemptContext, AttemptKind
 from devflow_ai.benchmark_run import (
     BenchmarkLimits, BenchmarkRunError, _model_id_from_environment, _now,
     compose_run_record, load_independent_material, policy_snapshot_differences,
@@ -43,17 +44,19 @@ from devflow_ai.benchmark_task import BenchmarkTaskError, load_policy_snapshot
 from devflow_ai.config import HeartbeatConfig
 from devflow_ai.coordinator import RunCoordinator, RunExecutionDeniedError, TaskClaimBusyError
 from devflow_ai.database import create_db_engine, create_session_factory
+from devflow_ai.execution_binding import ExecutionBindingError, verify_optional_binding
 from devflow_ai.independent_evaluation import (
     MaterialPlacementError, require_material_placement,
 )
 from devflow_ai.enums import RunStatus, TaskStatus
 from devflow_ai.harness import GitExecutionCancelledError
 from devflow_ai.model_gateways import model_gateways_from_env
-from devflow_ai.models import Run, Task
+from devflow_ai.memory import MemoryError, MemoryRecallRequest, MemoryService, RepositoryScope
+from devflow_ai.models import MemoryUse, Run, Task
 from devflow_ai.orchestration import drive_run_stages, finalize_benchmark_run
 from devflow_ai.policy import PolicyConfig
 from devflow_ai.services import TaskNotFoundError
-from devflow_ai.task_pack import TaskPackManifest, load_manifest, to_verification_config
+from devflow_ai.task_pack import TaskPackManifest, load_manifest, optional_scope_binding_matches, to_verification_config
 from devflow_ai.verification_config import VerificationConfig, public_test_modules
 from devflow_ai.worker import LinkedStopEvent, Worker
 
@@ -104,6 +107,14 @@ class WorkerRunRequest:
     # Where the reviewable run record goes. Exclusive create: an existing file is refused
     # before anything is claimed, and it is never overwritten when the attempt is replayed.
     record_path: Path | None = None
+    # Explicit operator-selected candidate for a non-formal development rehearsal.
+    memory_recall: MemoryRecallRequest | None = None
+    # Trusted control-plane material naming the exact package files this entry must be running.
+    # Both fields together or neither: verified before the claim, and the verified digest is
+    # written to the Run inside the claim transaction. "Neither" leaves the Run's version
+    # unknown, which is recorded honestly and never promotes.
+    execution_manifest: Path | None = None
+    execution_sha256: str | None = None
     limits: BenchmarkLimits = field(default_factory=BenchmarkLimits)
 
 
@@ -123,6 +134,9 @@ class PreparedWorkerRun:
     # Set when this Task already owns the Run this entry would create: the call is a replay
     # and must report that Run instead of executing it again.
     existing_run_id: UUID | None = None
+    expected_admission_record: dict | None = None
+    # The digest verified before the claim, or None when no manifest was supplied.
+    execution_sha256: str | None = None
 
 
 def trusted_baseline_platform_supported() -> bool:
@@ -132,6 +146,21 @@ def trusted_baseline_platform_supported() -> bool:
     as ``BASELINE_UNAVAILABLE``, so a formal attempt here would spend budget to learn that.
     """
     return os.name == "nt"
+
+
+def _verified_execution_sha256(request: WorkerRunRequest) -> str | None:
+    """Verify the pinned execution manifest before anything is claimed.
+
+    Both fields or neither: a digest without a manifest cannot be verified, and a manifest
+    without an independently supplied digest only proves the file agrees with itself. ``None``
+    means no version was pinned, which is recorded on the Run as unknown.
+    """
+    try:
+        return verify_optional_binding(
+            manifest_path=request.execution_manifest,
+            expected_sha256=request.execution_sha256, require_complete=True)
+    except ExecutionBindingError as error:
+        raise WorkerRunError(f"Execution binding refused: {error}") from None
 
 
 def prepare_worker_run(
@@ -152,6 +181,14 @@ def prepare_worker_run(
             "attempt_kind must be formal, rehearsal or unknown") from None
     if not isinstance(request.operator, str) or not request.operator.strip():
         raise WorkerRunError("operator must be a non-blank string")
+    if request.memory_recall is not None:
+        if attempt_kind is not AttemptKind.REHEARSAL or request.material_path is not None:
+            raise WorkerRunError("Memory-assisted runs require rehearsal and no independent material")
+        if request.memory_recall.operator != request.operator:
+            raise WorkerRunError("Memory operator must match the run operator")
+        if not isinstance(request.memory_recall.purpose, str) or not 1 <= len(request.memory_recall.purpose.strip()) <= 1000:
+            raise WorkerRunError("Memory purpose must be non-blank and at most 1000 characters")
+    execution_sha256 = _verified_execution_sha256(request)
     supported = (platform_supports_trusted_baseline
                  if platform_supports_trusted_baseline is not None
                  else trusted_baseline_platform_supported())
@@ -227,15 +264,21 @@ def prepare_worker_run(
         # second attempt. This check comes before the eligibility and snapshot checks so a
         # replay never depends on the Task still matching a prepared file.
         runs = session.execute(
-            select(Run.id, Run.creation_idempotency_key)
+            select(Run.id, Run.creation_idempotency_key, Run.execution_sha256)
             .where(Run.task_id == task.id)).all()
-        for run_id, creation_key in runs:
+        for run_id, creation_key, recorded_digest in runs:
             if creation_key == claim_key:
+                if recorded_digest != execution_sha256:
+                    # A replay may report the existing Run, but only as the version it really
+                    # ran. Anything else would let this call's manifest stand for that Run.
+                    raise WorkerRunError(
+                        "This Task's Run already exists under a different execution version "
+                        "than the one this call verified; refusing to report it as a replay")
                 return PreparedWorkerRun(
                     manifest=manifest, config=config, policy=prepared_policy,
                     claim_key=claim_key, attempt_kind=attempt_kind,
                     trusted_baseline_supported=supported, material=material,
-                    existing_run_id=run_id)
+                    existing_run_id=run_id, execution_sha256=execution_sha256)
         if request.record_path is not None and Path(request.record_path).exists():
             # A run record is evidence: refuse before claiming rather than discovering the
             # collision afterwards, and never overwrite what is already there. A replay of
@@ -251,6 +294,9 @@ def prepare_worker_run(
                 "ELIGIBLE Task")
         if task.base_commit != manifest.base_commit:
             raise WorkerRunError("Task base commit does not match the task pack")
+        if not optional_scope_binding_matches(task.admission_record, manifest):
+            raise WorkerRunError("Task scope binding does not match the task pack")
+        prepared_admission = deepcopy(task.admission_record)
         if not task.policy_snapshot:
             raise WorkerRunError("Task has no pinned Policy snapshot")
         try:
@@ -273,10 +319,32 @@ def prepare_worker_run(
             raise WorkerRunError(
                 "This Task already has a Run; a second attempt needs a new Task so both "
                 "attempts stay independent")
+        repository = task.repo
+    if request.memory_recall is not None:
+        selection = request.memory_recall
+        try:
+            scope = RepositoryScope(repository)
+            with session_factory() as session:
+                if session.scalar(select(MemoryUse.id).where(MemoryUse.idempotency_key == selection.idempotency_key)):
+                    raise WorkerRunError("Memory use key is already in use")
+            with session_factory() as session:
+                candidate = MemoryService(session).read(scope=scope, memory_id=selection.memory_id)
+            if candidate is None or candidate["candidate_sha256"] != selection.candidate_sha256 or not candidate["topic"]:
+                raise WorkerRunError("Selected memory candidate is unavailable")
+            with session_factory() as session:
+                candidates = MemoryService(session).inspect_candidates(scope=scope,
+                    target_task_id=request.task_id, topic=candidate["topic"], limit=100,
+                    target_environment=selection.target_environment)
+            if not any(item["id"] == str(selection.memory_id) and item["candidate_checks"]["eligible_to_request_use"]
+                       for item in candidates):
+                raise WorkerRunError("Selected memory candidate is not eligible for this Task")
+        except MemoryError as error:
+            raise WorkerRunError(f"Memory selection is unavailable: {type(error).__name__}") from None
     return PreparedWorkerRun(
         manifest=manifest, config=config, policy=policy, claim_key=claim_key,
         attempt_kind=attempt_kind, trusted_baseline_supported=supported,
-        material=material)
+        material=material, expected_admission_record=prepared_admission,
+        execution_sha256=execution_sha256)
 
 
 def _finalize_stage(
@@ -324,7 +392,11 @@ def _write_record(
     """
     if request.record_path is None:
         return {"written": False, "path": None, "outcome": None, "error": None}
-    finalization = stage_result.get("finalization") or {
+    # What the finalization step actually returned. The placeholder below is only what the
+    # classifier needs to describe an attempt that never got there; it must not be recorded as
+    # a finalization that happened.
+    observed_finalization = stage_result.get("finalization")
+    finalization = observed_finalization or {
         "outcome": "skipped",
         "reason": "not_attempted" if error is None else "execution_error"}
     try:
@@ -337,6 +409,9 @@ def _write_record(
                 attempt_kind=prepared.attempt_kind,
                 artifact_root=request.artifacts_root / str(run_id),
                 finalization=finalization, deadline_fired=deadline_fired,
+                attempt_context=AttemptContext.observed(
+                    deadline_fired=deadline_fired, finalization=observed_finalization,
+                    execution_sha256=prepared.execution_sha256, source="worker_run"),
                 artifacts_root=request.artifacts_root, started_at=started_at,
                 limits=request.limits, error=error, stage_notes=stage_notes)
         write_run_record(record, request.record_path)
@@ -365,6 +440,9 @@ def run_worker_once(
     """
     prepared = (prepared if prepared is not None
                 else prepare_worker_run(request, session_factory=session_factory))
+    if request.memory_recall is not None and (
+            prepared.attempt_kind is not AttemptKind.REHEARSAL or prepared.material is not None):
+        raise WorkerRunError("Memory-assisted runs require rehearsal and no independent material")
     if stop_event is not None and stop_event.is_set():
         # Nothing has been claimed or changed yet: report the stop instead of creating a Run
         # that would only be abandoned.
@@ -375,7 +453,7 @@ def run_worker_once(
                 "trusted_baseline_supported": prepared.trusted_baseline_supported,
                 "writes_record": False, "formal_acceptance": "not_performed",
                 "record_path": None, "record_outcome": None,
-                "record_error": None}
+                "record_error": None, "execution_sha256": prepared.execution_sha256}
     if prepared.existing_run_id is not None:
         # This Task's Run already exists under this entry's claim key: report it rather than
         # driving a second attempt. The CLI reaches this through ``prepare_worker_run``, so
@@ -393,7 +471,7 @@ def run_worker_once(
                 "trusted_baseline_supported": prepared.trusted_baseline_supported,
                 "writes_record": False, "formal_acceptance": "not_performed",
                 "record_path": None, "record_outcome": None,
-                "record_error": None}
+                "record_error": None, "execution_sha256": prepared.execution_sha256}
     with session_factory() as session:
         try:
             # The Task row is locked for this transaction and the prepared base commit and
@@ -402,7 +480,9 @@ def run_worker_once(
             run, created = RunCoordinator(session, worker.lease_config).start_initial_run(
                 request.task_id, worker.worker_id, prepared.claim_key,
                 expected_base_commit=prepared.manifest.base_commit,
-                expected_policy=prepared.policy)
+                expected_policy=prepared.policy, check_admission_record=True,
+                expected_admission_record=prepared.expected_admission_record,
+                execution_sha256=prepared.execution_sha256)
         except TaskClaimBusyError as error:
             raise WorkerRunBusyError(str(error)) from None
         except (ValueError, LookupError) as error:
@@ -426,7 +506,7 @@ def run_worker_once(
                 "trusted_baseline_supported": prepared.trusted_baseline_supported,
                 "writes_record": False, "formal_acceptance": "not_performed",
                 "record_path": None, "record_outcome": None,
-                "record_error": None}
+                "record_error": None, "execution_sha256": prepared.execution_sha256}
 
     started_at = _now()
     fired = {"deadline": False}
@@ -456,7 +536,8 @@ def run_worker_once(
                 verification_config=prepared.config,
                 max_stages=request.limits.max_stages, max_read_bytes=max_read_bytes,
                 max_patch_bytes=max_patch_bytes,
-                verifier_max_diff_bytes=verifier_max_diff_bytes))
+                verifier_max_diff_bytes=verifier_max_diff_bytes,
+                **({"memory_recall": request.memory_recall} if request.memory_recall is not None else {})))
         # The trusted evaluation runs inside the same heartbeat, lease, execution right and
         # stop event as the stages: it needs a live stop event, and a result committed after
         # this call returned would no longer be covered by either.
@@ -481,7 +562,11 @@ def run_worker_once(
         worker.execute_run(
             run_id, workspaces_root=request.workspaces_root,
             artifacts_root=request.artifacts_root, heartbeat_config=heartbeat_config,
-            process_run=process, external_stop_event=signal_stop)
+            process_run=process, external_stop_event=signal_stop,
+            # The execution boundary re-verifies the pinned inventory; handing it the digest
+            # alone would let a caller's claim stand for verification.
+            execution_manifest=request.execution_manifest,
+            execution_sha256=prepared.execution_sha256)
     except (GitExecutionCancelledError, RunExecutionDeniedError) as caught:
         # Two cooperative shapes mean "stop": a cancelled git/tool call, and a stage that
         # refused to start because the Run had been asked to stop. Either is a stop only
@@ -539,6 +624,9 @@ def run_worker_once(
         "material_supplied": prepared.material is not None,
         "pack_id": prepared.manifest.pack_id,
         "base_commit": prepared.manifest.base_commit,
+        # The digest verified before the claim and written to the Run; None means no version
+        # was pinned for this attempt, which is reported rather than assumed.
+        "execution_sha256": prepared.execution_sha256,
     }
 
 
@@ -613,8 +701,22 @@ def main(
     parser.add_argument("--attempt-kind", choices=["formal", "rehearsal"], default="formal",
                         help="'rehearsal' marks an environment check; a formal attempt is "
                              "refused where the trusted baseline cannot be recorded.")
+    parser.add_argument("--execution-manifest",
+                        help="Pinned file inventory for the code this entry runs (JSON from "
+                             "`python -m devflow_ai.execution_manifest create`). Verified "
+                             "against the running package before anything is claimed. Supply "
+                             "with --execution-sha256 or not at all.")
+    parser.add_argument("--execution-sha256",
+                        help="The pinned manifest digest, kept separately from the manifest "
+                             "file. A mismatch refuses the start; the verified digest is "
+                             "written to the Run.")
     parser.add_argument("--worker-id",
                         help="Actor recorded on the Run; defaults to a fresh UUID-based id.")
+    parser.add_argument("--memory-id", help="Explicit memory candidate UUID for a development rehearsal.")
+    parser.add_argument("--memory-sha256", help="Candidate digest obtained from preview.")
+    parser.add_argument("--memory-use-key", help="Fresh UUID for the operator declaration.")
+    parser.add_argument("--memory-environment", help="Operator-declared target environment label.")
+    parser.add_argument("--memory-purpose", default="development exploration")
     parser.add_argument("--max-read-bytes", type=int, default=65536)
     parser.add_argument("--max-patch-bytes", type=int, default=65536)
     parser.add_argument("--max-diff-bytes", type=int, default=262144)
@@ -644,13 +746,28 @@ def main(
     except (TypeError, ValueError):
         return _configuration_error("task-id must be a UUID")
 
+    memory_fields = (args.memory_id, args.memory_sha256, args.memory_use_key, args.memory_environment)
+    if any(value is not None for value in memory_fields) and not all(memory_fields):
+        return _configuration_error("All four memory selection arguments are required together")
+    memory_recall = None
+    if all(memory_fields):
+        try:
+            memory_recall = MemoryRecallRequest(idempotency_key=UUID(args.memory_use_key),
+                memory_id=UUID(args.memory_id), candidate_sha256=args.memory_sha256,
+                operator=args.operator, purpose=args.memory_purpose, target_environment=args.memory_environment)
+        except (TypeError, ValueError):
+            return _configuration_error("Memory ID and use key must be UUIDs")
+
     request = WorkerRunRequest(
         pack_dir=Path(args.pack), policy_path=Path(args.policy), task_id=task_id,
         operator=args.operator, python_executable=args.python_executable,
         workspaces_root=Path(args.workspaces_root),
         artifacts_root=Path(args.artifacts_root), attempt_kind=args.attempt_kind,
         material_path=Path(args.material) if args.material else None,
-        record_path=Path(args.record) if args.record else None)
+        record_path=Path(args.record) if args.record else None, memory_recall=memory_recall,
+        execution_manifest=(Path(args.execution_manifest)
+                            if args.execution_manifest else None),
+        execution_sha256=args.execution_sha256)
     engine = None
     try:
         if session_factory is None:

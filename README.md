@@ -23,7 +23,10 @@ Issue → Task 准入 → Run → Supervisor 路由
   一次性 Worker 执行入口（`python -m devflow_ai.worker_run`）与常驻调度入口
   （`python -m devflow_ai.worker_scheduler`，只执行可信清单里登记的 Task）已实现并接入 Compose 的可选服务；
   它们只执行登记或指定的 Task，不是自动发现任务的调度器；容器内的正式验收仍受平台限制。
-- 多任务评测仍在完善；长期记忆、Skills 和受控 RSI 是后续规划。
+- 已实现面向可信操作者的记忆候选、审核、冲突与版本关系、停用及同仓库候选预览；命令入口为 `python -m devflow_ai.memory --help`。可信调用方可在开发演练中显式选择一条候选，经阶段驱动交给下一次 Explorer，内容仍未核实；通过该路径标记过记忆输入的 Task 不得提交独立评测结果。默认调度不会自动选择，仓库标签也不是身份认证；具体入口见 [部署说明](docs/DEPLOYMENT.md)。
+- 已实现测试命令与修改范围检查 Skills，Worker 的补丁前基线、补丁后公开测试及符合条件的范围诊断复用这些 Skill；调用经过既有工具和权限边界，尚缺真实多任务复用证据。
+- 多任务与重复评测仍在完善；受控 RSI 尚未达到启动门槛，见 [RSI 前置条件](docs/RSI_READINESS.md)。记忆相关迁移尚未应用于已有业务数据库。
+- 受控 RSI 已有实验账目、预算通道与双进程模型桩演示；尚无真实候选改进或独立对照评测，自动循环和接受晋升仍禁用。可复现步骤见 [演示说明](docs/DEMO.md)，项目介绍及证据边界见 [简历项目草稿](docs/RESUME_PROJECT.md)。
 
 最新进度以 [docs/PROGRESS.md](docs/PROGRESS.md) 顶部为准；架构和阶段目标见 [docs/SPEC.md](docs/SPEC.md)。
 

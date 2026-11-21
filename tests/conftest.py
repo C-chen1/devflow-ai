@@ -75,12 +75,17 @@ def run_session_factory(test_session_factory):
     start_spec = importlib.util.spec_from_file_location(start_path.stem, start_path)
     start_revision = importlib.util.module_from_spec(start_spec)
     start_spec.loader.exec_module(start_revision)
+    version_path = Path(__file__).resolve().parents[1] / "migrations/versions/e2f5b8c41d07_add_run_execution_sha256.py"
+    version_spec = importlib.util.spec_from_file_location(version_path.stem, version_path)
+    version_revision = importlib.util.module_from_spec(version_spec)
+    version_spec.loader.exec_module(version_revision)
     with engine.begin() as connection:
         connection.execute(text(f'SET LOCAL search_path TO "{schema}", public'))
         with Operations.context(MigrationContext.configure(connection)):
             revision.upgrade()
             recovery_revision.upgrade()
             start_revision.upgrade()
+            version_revision.upgrade()
     return test_session_factory
 
 

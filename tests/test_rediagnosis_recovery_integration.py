@@ -722,7 +722,9 @@ def test_two_workers_reclaim_same_expired_run_without_duplicate_recovery(
                 workspaces_root=workspaces, artifacts_root=artifacts,
                 supervisor_gateway=gateway, explorer_gateway=None, planner_gateway=None,
                 recovery_max_read_bytes=1024, stop_event=Event())
-        except (RunExecutionDeniedError, TaskClaimBusyError) as exc:
+        # If the other worker has already committed the shared key, the coordinator
+        # rejects replay by a different owner with RunCreationConflictError.
+        except (RunExecutionDeniedError, TaskClaimBusyError, RunCreationConflictError) as exc:
             return type(exc).__name__
 
     with ThreadPoolExecutor(max_workers=2) as pool:

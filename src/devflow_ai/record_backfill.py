@@ -20,7 +20,7 @@ from datetime import timezone
 from pathlib import Path
 from uuid import UUID
 
-from devflow_ai.benchmark_record import AttemptKind, write_run_record
+from devflow_ai.benchmark_record import AttemptContext, AttemptKind, write_run_record
 from devflow_ai.benchmark_run import compose_run_record
 from devflow_ai.database import create_db_engine, create_session_factory
 from devflow_ai.enums import RunStatus
@@ -105,6 +105,10 @@ def backfill_record(request: BackfillRequest, *, session_factory) -> dict:
             operator=request.operator.strip(), attempt_kind=attempt_kind,
             artifact_root=Path(request.artifacts_root) / str(run.id),
             finalization=None, deadline_fired=False,
+            # The deadline and the finalization step stay unknown; the execution digest is a
+            # value the Run row already records, so a reconstruction may copy it.
+            attempt_context=AttemptContext.unknown(
+                source="backfill_reconstruction", execution_sha256=run.execution_sha256),
             artifacts_root=Path(request.artifacts_root), started_at=started_at,
             limits=None, model_id="unrecorded", attempt_index=attempt_index,
             finished_at=finished_at, extra_notes=notes)

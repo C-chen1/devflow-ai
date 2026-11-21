@@ -169,6 +169,10 @@ class SchedulerRequest:
     workspaces_root: Path
     artifacts_root: Path
     attempt_kind: str = "formal"
+    # The same pinned execution inventory the one-shot entry verifies. Every Run this
+    # scheduler creates is started under it; both fields or neither.
+    execution_manifest: Path | None = None
+    execution_sha256: str | None = None
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS
     # Batch mode (default) works through one manifest read and exits. Resident mode keeps
     # re-reading the same manifest until it is stopped.
@@ -195,6 +199,8 @@ def _request_for(entry: SchedulerTaskEntry, request: SchedulerRequest) -> Worker
         artifacts_root=request.artifacts_root, attempt_kind=request.attempt_kind,
         material_path=(Path(entry.material) if entry.material is not None else None),
         record_path=(Path(entry.record) if entry.record is not None else None),
+        execution_manifest=request.execution_manifest,
+        execution_sha256=request.execution_sha256,
         limits=request.limits)
 
 
@@ -559,6 +565,14 @@ def main(argv: list[str] | None = None, *, session_factory=None, gateways_factor
     parser.add_argument("--attempt-kind", choices=["formal", "rehearsal"], default="formal",
                         help="Applied to every registered Task; a formal attempt is refused "
                              "where the trusted baseline cannot be recorded.")
+    parser.add_argument("--execution-manifest",
+                        help="Pinned file inventory for the code this scheduler runs; verified "
+                             "before every claim it makes, and the verified digest is "
+                             "recorded on each Run. Supply with --execution-sha256 or not "
+                             "at all.")
+    parser.add_argument("--execution-sha256",
+                        help="The pinned manifest digest, kept separately from the manifest "
+                             "file.")
     parser.add_argument("--watch", action="store_true",
                         help="Resident mode: keep re-reading the manifest at the poll interval "
                              "instead of exiting once every registered Task is concluded. "
@@ -613,6 +627,9 @@ def main(argv: list[str] | None = None, *, session_factory=None, gateways_factor
             python_executable=args.python_executable,
             workspaces_root=Path(args.workspaces_root),
             artifacts_root=Path(args.artifacts_root), attempt_kind=args.attempt_kind,
+            execution_manifest=(Path(args.execution_manifest)
+                                if args.execution_manifest else None),
+            execution_sha256=args.execution_sha256,
             poll_interval_seconds=args.poll_interval_seconds, resident=args.watch,
             max_read_bytes=args.max_read_bytes, max_patch_bytes=args.max_patch_bytes,
             max_diff_bytes=args.max_diff_bytes,

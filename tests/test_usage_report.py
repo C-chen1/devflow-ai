@@ -1,10 +1,12 @@
 import json
+import pytest
 from contextlib import nullcontext
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import devflow_ai.usage_report as usage_report_module
 from devflow_ai.usage_report import (
-    UsageReportError, compare_usage, load_run_usage, main, summarize_usage,
+    UsageReportError, compare_usage, load_run_usage, load_task_usage, main, summarize_usage,
 )
 
 
@@ -64,6 +66,39 @@ def test_comparison_reports_roles_only_one_run_used():
     assert "does not by itself prove" in comparison["caveat"]
 
 
+def test_comparison_does_not_treat_unsettled_or_missing_usage_as_zero():
+    first = {"run_id": "first", **summarize_usage([
+        ("supervisor", {"model_requests": dict([_settled("a", 300, 20)])}),
+        ("explorer", {"model_requests": dict([_unsettled("b", 100)])}),
+    ])}
+    second = {"run_id": "second", **summarize_usage([
+        ("supervisor", {"model_requests": dict([_settled("c", 100, 10)])}),
+        ("explorer", None),
+    ])}
+    comparison = compare_usage(first, second)
+    roles = {row["role"]: row for row in comparison["roles"]}
+    assert roles["supervisor"]["delta"] == -210
+    assert roles["explorer"]["delta"] is None and roles["explorer"]["change"] is None
+    assert comparison["total"]["delta"] is None and comparison["total"]["change"] is None
+    assert not comparison["recorded_agent_usage_complete"]
+
+
+@pytest.mark.parametrize("actual", [{"input_tokens": 10}, {"input_tokens": -1, "output_tokens": 1},
+                                    {"input_tokens": True, "output_tokens": 1}])
+def test_malformed_settled_usage_is_not_counted_as_zero(actual):
+    with pytest.raises(UsageReportError, match="invalid token counts"):
+        summarize_usage([("coder", {"model_requests": {"r": {"actual_usage": actual}}})])
+
+
+def test_legacy_usage_makes_role_and_total_comparison_incomplete():
+    first = {"run_id": "first", **summarize_usage([("coder", {"prompt": "legacy"})])}
+    second = {"run_id": "second", **summarize_usage([("coder", {"model_requests": {}})])}
+    comparison = compare_usage(first, second)
+    assert first["unknown_usage_executions"] == 1
+    assert comparison["roles"][0]["delta"] is None
+    assert comparison["total"]["delta"] is None
+
+
 def test_an_unknown_run_is_a_configuration_error(monkeypatch, capsys):
     def missing(session, run_id):
         raise UsageReportError("Run does not exist")
@@ -117,3 +152,94 @@ def test_load_run_usage_reads_role_and_usage_only():
 
     assert report["run_id"] == str(run_id) and report["total_tokens"] == 11
     assert report["status"] == "RUNNING" and report["attempt_number"] == 1
+
+
+def test_task_usage_counts_admission_once_and_separates_all_runs(worker_session_factory, capsys):
+    from devflow_ai.enums import AgentExecutionStatus, RunStatus
+    from devflow_ai.models import AgentExecution, Run, Task
+    from devflow_ai.services import TaskService
+
+    factory = worker_session_factory
+    with factory() as session:
+        task, _ = TaskService(session).create_task(title="usage fixture", description="test",
+            repo="example", idempotency_key=uuid4())
+        task_id = task.id
+    with factory.begin() as session:
+        task = session.get(Task, task_id)
+        task.admission_usage = dict([_settled("admission", 10, 2), _unsettled("pending", 20)])
+        for attempt, status, usage in (
+            (1, RunStatus.FAILED, {"model_requests": dict([_settled("first", 30, 4)])}),
+            (2, RunStatus.PASSED, None),
+        ):
+            run = Run(task_id=task_id, attempt_number=attempt, status=status,
+                creation_idempotency_key=str(uuid4()), worker_id="fixture",
+                lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1))
+            session.add(run)
+            session.flush()
+            session.add(AgentExecution(run_id=run.id, agent_role="coder", status=AgentExecutionStatus.SUCCEEDED,
+                input={}, llm_usage=usage))
+    with factory() as session:
+        report = load_task_usage(session, task_id)
+    assert report["admission"]["total_tokens"] == 12
+    assert [run["attempt_number"] for run in report["runs"]] == [1, 2]
+    assert report["recorded_settled_tokens"] == 46
+    assert report["unsettled_requests"] == 1 and report["unknown_usage_executions"] == 1
+    assert main(["--task", str(task_id)], session_factory=factory) == 0
+    assert json.loads(capsys.readouterr().out)["recorded_settled_tokens"] == 46
+    assert main(["--task", str(task_id), "--compare", str(uuid4())], session_factory=factory) == 2
+
+
+def test_task_usage_stays_consistent_when_a_run_is_added_during_read(worker_session_factory, monkeypatch):
+    from devflow_ai.enums import AgentExecutionStatus, RunStatus
+    from devflow_ai.models import AgentExecution, Run
+    from devflow_ai.services import TaskService
+
+    factory = worker_session_factory
+    with factory() as session:
+        task, _ = TaskService(session).create_task(title="usage fixture", description="test",
+            repo="example", idempotency_key=uuid4())
+        task_id = task.id
+    def add_run(attempt):
+        with factory.begin() as session:
+            run = Run(task_id=task_id, attempt_number=attempt, status=RunStatus.FAILED,
+                creation_idempotency_key=str(uuid4()), worker_id="fixture",
+                lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1))
+            session.add(run)
+            session.flush()
+            session.add(AgentExecution(run_id=run.id, agent_role="coder", status=AgentExecutionStatus.SUCCEEDED,
+                input={}, llm_usage={"model_requests": dict([_settled(str(attempt), 10, 1)])}))
+    add_run(1)
+    with factory() as session:
+        original = session.execute
+        inserted = []
+        def execute_and_add(statement, *args, **kwargs):
+            result = original(statement, *args, **kwargs)
+            sql = str(statement)
+            if not inserted and ("FROM runs" in sql or "LEFT OUTER JOIN runs" in sql):
+                inserted.append(True)
+                add_run(2)
+            return result
+        monkeypatch.setattr(session, "execute", execute_and_add)
+        report = load_task_usage(session, task_id)
+    assert inserted and [run["attempt_number"] for run in report["runs"]] == [1]
+    assert report["recorded_settled_tokens"] == 11
+    with factory() as session:
+        later = load_task_usage(session, task_id)
+    assert [run["attempt_number"] for run in later["runs"]] == [1, 2]
+    assert later["recorded_settled_tokens"] == 22
+
+
+def test_task_usage_supports_tasks_without_runs(worker_session_factory):
+    from devflow_ai.services import TaskService
+
+    factory = worker_session_factory
+    with factory() as session:
+        task, _ = TaskService(session).create_task(title="usage fixture", description="test",
+            repo="example", idempotency_key=uuid4())
+        task_id = task.id
+    with factory() as session:
+        report = load_task_usage(session, task_id)
+        assert report["runs"] == [] and report["recorded_settled_tokens"] == 0
+    with factory() as session:
+        with pytest.raises(UsageReportError, match="Task does not exist"):
+            load_task_usage(session, uuid4())

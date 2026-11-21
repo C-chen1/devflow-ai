@@ -160,7 +160,7 @@ def drive_run_stages(
     session_factory: sessionmaker[Session], run_id: UUID, *, worker, gateways,
     directories, stop_event, verification_config, max_stages: int = 32,
     max_read_bytes: int = 65536, max_patch_bytes: int | None = None,
-    verifier_max_diff_bytes: int | None = None,
+    verifier_max_diff_bytes: int | None = None, memory_recall=None,
 ) -> dict:
     """Assemble the receivers and supervision builders for one Run, then drive it.
 
@@ -178,6 +178,7 @@ def drive_run_stages(
             run_id, directories=directories, max_bytes=max_read_bytes,
             stop_event=stop_event, explorer_gateway=gateways.explorer,
             planner_gateway=gateways.planner, verification_config=verification_config,
+            **({"memory_recall": memory_recall} if memory_recall is not None else {}),
             **({"coder_gateway": gateways.coder,
                 "max_patch_bytes": max_patch_bytes} if coder_enabled else {}),
             **({"verifier_gateway": gateways.verifier,

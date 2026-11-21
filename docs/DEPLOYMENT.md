@@ -55,8 +55,14 @@ docker compose --env-file .env run --rm migrate upgrade head
 
 `run --rm` 会在命令结束后删除一次性容器，不留下半启动的状态。升级仍会改动 `.env` 指向的数据库：
 先核对库名、当前 revision 与计划，不要对已有业务数据直接 `upgrade head`。
-项目 head 是 `b7f2c31d8a90`；停留在旧 revision 的库不满足要求 `at_head` 的 preflight。
-历史 Task 与历史人工审核不会被回填。
+当前工作区的项目 head 是 `e2f5b8c41d07`；其中 `b7f2c31d8a90` 之后增加了记忆候选、审核、冲突、
+版本关系和使用声明表，以及候选适用条件字段；`b41e9d2c8370` 之后增加了受控 RSI 的实验账目六张表
+（实验限额、声明任务集、候选、token 预留与逐次尝试结论，见 `docs/RSI_READINESS.md`）；随后增加的
+`e2f5b8c41d07` 为 Run 增加可空的执行清单摘要。停留在旧
+revision 的库不满足要求 `at_head` 的 preflight。
+这些迁移已在隔离测试 schema 中验证，**没有因此应用到现有案例库**；对已有业务数据库的升级仍须单独计划。
+历史 Task、Run 与人工审核不会由这些迁移回填或改写。实验账目可由可信操作者显式调用第 3.2 节入口写入；
+尚未接入自动实验循环。
 
 ## 3. 一次性 Worker 入口：`python -m devflow_ai.worker_run`
 
@@ -64,8 +70,8 @@ docker compose --env-file .env run --rm migrate upgrade head
 
 - `python -m devflow_ai.worker` 仍然只是领取一个 Run 做检查（`--once`，不执行 Agent），本批没有改它；
 - `python -m devflow_ai.benchmark_run` 领取、驱动并写出**基准运行记录**；
-- `worker_run` 领取并驱动一个具名 Task 的阶段，**不写基准记录、不写正式 Verification**，
-  只报告停在哪一步。正式验收仍由可信入口完成。
+- `worker_run` 领取并驱动一个具名 Task 的阶段；可选写入运行记录，配置可信独立评测材料时可进入既有
+  正式 Verification 流程。开发演练不等于正式独立评测，具体执行取决于调用参数和运行结果。
 
 它复用既有实现，没有新增调度框架：阶段驱动 `orchestration.drive_run_stages`（与基准入口共用同一份
 接线）、`Worker.execute_run` 的心跳与租约、`RunCoordinator` 的执行权与原子领取、模型网关
@@ -86,6 +92,16 @@ docker compose --env-file .env run --rm migrate upgrade head
 `RunCoordinator.start_initial_run` 的 Task 行锁事务里，并把准备的 `base_commit` 与 Policy 快照传进去要求
 **在同一事务内复核**：Task 若在准备之后被改过（commit 或 Policy 快照），创建被拒绝、不产生 Run。
 领取本身仍有 `TaskStateConflictError` 与 `TaskClaimBusyError` 兜底，并发创建不会产生两个 Run。
+
+**执行版本可以固定并核验（可选）。** 可信控制端可以用
+`python -m devflow_ai.execution_manifest create --root <包目录> --file <相对路径> ...` 生成清单、把
+`manifest_sha256` 单独保存，然后在 `worker_run` / `scheduler` / `benchmark_run` 上同时提供
+`--execution-manifest <清单文件> --execution-sha256 <独立保存的摘要>`（两者必须同时给或都不给）。
+入口在**领取之前**按独立 pin 核验：清单摘要不符、所列文件缺失或字节变化、或清单漏掉包内任一 Python
+模块，都会拒绝启动（退出 2，不创建 Run）。核验根目录固定为本进程导入的 `devflow_ai` 包目录，不能用参数指向别处。核验通过后摘要写入
+`runs.execution_sha256`（同一领取事务），同一 Task 之后的重试/再诊断必须沿用同一摘要，否则拒绝。
+没有提供清单时该列为 NULL，表示未知：不会回填历史 Run，也不会被实验账目当作可晋升证据。这证明的是
+"本进程核验过的字节与 pin 一致"，不是进程不可撒谎、清单覆盖所有导入文件、或工作区快照已被绑定。
 
 **重复调用只有一个答案。** 同一个 Task 的第二次调用（无论是直接再调 API 还是再跑一次 CLI）会看到
 该 Task 已存在本入口用同一幂等键 `worker:<task>:1` 创建的 Run，于是返回 `existing_run`（`claimed=false`、
@@ -136,6 +152,19 @@ docker compose --env-file .env run --rm `
 建议可信侧用原子替换（写临时文件再 rename）更新清单，减少读到半份文件的机会；即使读到半份，
 上面的暂停机制也只会暂停领取，不会按旧清单继续。
 
+### 显式记忆开发演练
+
+已有记忆相关迁移且使用专用开发库时，可信操作者可先用 `python -m devflow_ai.memory preview --help` 查看候选，审核候选内容和来源，并确认内容可提供给模型、没有隐藏评测材料。对**未标记为 benchmark 的开发 Task**，可在上面的 `worker_run` 命令中额外提供：
+
+```text
+--attempt-kind rehearsal --memory-id <候选 UUID> --memory-sha256 <候选摘要>
+--memory-use-key <新的 UUID> --memory-environment <环境标签> --confirm-run
+```
+
+可选 `--memory-purpose` 记录用途，默认是 `development exploration`。四个记忆参数必须同时提供；环境标签是操作者声明，不是自动观测。运行前会检查候选审核、范围、来源、有效期和适用条件，并拒绝已知 benchmark Task、正式尝试或任何独立评测材料。领取之后条件仍可能变化，或目标 Task 被其他事务占用，此时执行会拒绝并保留 Run 的实际状态，不自动重试或关闭；后续应先检查该 Run，而不是直接重复启动。记忆声明、来源和 Explorer 输入可在数据库记录中追溯；声明本身不代表模型确实收到或采用了内容。
+
+这是非正式开发演练，不运行独立评测。通过该接线记录过记忆输入的 Task，包括后续 Run，不得提交独立评测结果；默认 Worker 和调度器仍不自动选取记忆。以上命令会发起模型调用，执行前需单独确定任务、模型、预算及证据；**不要对已有业务数据库擅自运行迁移**。
+
 ## 3.1 常驻调度入口：`python -m devflow_ai.worker_scheduler`
 
 这是 `docs/WORKER_SCHEDULER_PLAN.md` 的实现：**只处理可信清单里登记的 Task**，每个登记项复用上面的
@@ -152,7 +181,8 @@ docker compose --env-file .env run --rm `
 ```
 
 相对路径按清单文件所在目录解析；未知字段、重复 Task、不可读文件都会被拒绝（拒绝信息只报字段位置，
-不回显文件内容）。清单本身**不授予执行权**，真正的领取仍由 Task 行锁与幂等约束完成。
+不回显文件内容）。清单本身**不授予执行权**，真正的领取仍由 Task 行锁与幂等约束完成。`--execution-manifest` /
+`--execution-sha256` 与一次性入口语义相同：每次领取前核验，核验结果写入该次 Run。
 
 两种模式共用同一套领取与驱动：
 
@@ -188,7 +218,7 @@ docker compose --env-file .env run --rm `
 
 `record` 是可选的运行记录位置（相对清单目录解析）。写记录复用基准入口同一套 `BenchmarkRunRecord`、同一条分类逻辑
 （`classify_outcome`）与同一个排他创建；`formal_pass` 只有在正式 Verification 与证据都能从磁盘读回时才会出现，
-绝不从 Agent 自述或"测试通过"推断。记录含 Task、Run、`attempt_kind`、模型、Policy 版本、证据引用与产物目录，
+绝不从 Agent 自述或"测试通过"推断。记录含 Task、Run、`attempt_kind`、模型、Policy 版本、证据引用与产物目录，以及执行进程自己观察到的结束上下文（截止是否触发、是否发生 finalization、核验过的执行摘要，见 `attempt_context`；补写路径对前两项只能写 unknown，执行摘要则从 Run 行复制），
 人工审核结论**留空**（`pending`）——之后由真人用 `benchmark_record review` 生成审核副本、再 `task_review` 入库；
 调度器不会自动填结论，也不回填历史 Task。记录路径已存在时在**领取之前**拒绝该项；重放（同一 Task 已有 Run）
 不写记录也不重新运行；两个登记项不能共用同一个记录路径（清单加载时拒绝）。
@@ -206,7 +236,7 @@ uv run --env-file .env --locked python -m devflow_ai.record_backfill `
 它只读数据库与产物目录、**不建 Run、不重跑任务、不调用模型、不改任何行**，用同一套 `classify_outcome`
 与排他创建写出**一份新的**待审核记录。能重建的：Task/Run、任务包与 base commit、Policy 版本、Run 的开始与
 结束时间、公开检查与独立评测证据、以及可核验时的 `formal_pass`（必须能读回正式 Verification、草稿与回执）。
-**不能重建、因此如实标注而不推测的**：截止时间（不写 `timeout`）、`attempt_kind`（默认 `unknown`，即使
+**不能重建、因此如实标注而不推测的**：截止时间（不写 `timeout`，`attempt_context` 记为 unknown）、`attempt_kind`（默认 `unknown`，即使
 Run 通过也不进正式样本；只有操作者显式声明才写入并注明是声明）、模型标识（写 `unrecorded`）、人工审核结论
 （保持 `pending`），以及"独立评测是否尝试过"（记录为未记录，结果通常是 `incomplete`）。仍在 `RUNNING` 的
 Run、Task/Run 不匹配、缺少结束时间、目标文件已存在都会被明确拒绝。
@@ -274,6 +304,37 @@ docker compose --env-file .env run --rm `
 与幂等键识别已领取任务，没有独立的调度状态表；多 Worker 之间的分工完全依靠 Task 行锁与执行权，
 没有队列或分区；常驻模式的"修复后重新检查"只认清单条目与任务包/Policy 文件的变化，不轮询数据库状态。
 若将来需要自动发现、优先级或公平调度，那需要新增持久契约，本批没有做也不会假装已有。
+
+## 3.2 实验账目录入口：`python -m devflow_ai.experiment_record`
+
+可信操作者用它把一次**已结束**的尝试记入受控实验的账目，或只读地查看账目。它不创建 Run、不调用模型、
+不发起评测，也不启动任何循环；镜像里同样不包含实验数据或材料。
+
+```powershell
+# 只读：限额、用量、逐候选结果与背后的上下文/版本证据
+uv run --env-file .env --locked python -m devflow_ai.experiment_record summary --experiment <uuid>
+
+# 控制端固定某次尝试（一个 Run）的运行记录摘要（只存摘要，不复制文件）。
+# 必须在 record-result 之前执行：结果一旦入账，来源就被冻结，事后登记会被拒绝。
+uv run --env-file .env --locked python -m devflow_ai.experiment_record register-record `
+  --experiment <uuid> --candidate <label> --task-id <uuid> `
+  --record D:/records/<attempt>.json --operator <name>
+
+# 只读：某候选哪些必要条件成立、哪些不成立（始终 acceptable=false，并列出剩余阻塞项）
+uv run --env-file .env --locked python -m devflow_ai.experiment_record explain-acceptance `
+  --experiment <uuid> --candidate <label>
+
+# 记入一次尝试：结论只能来自共享分类器，不能由操作者指定
+uv run --env-file .env --locked python -m devflow_ai.experiment_record record-result `
+  --experiment <uuid> --candidate <label> --task-id <uuid> --run-id <uuid> `
+  --artifacts-root D:/devflow-run/artifacts --suite-version <pin> `
+  --record D:/records/<attempt>.json --operator <name>
+```
+
+`--record` 指向该尝试自己写的运行记录时，账目用记录里的截止/finalization 上下文并对该文件计摘要；没有
+记录时必须显式给 `--deadline-context`（`fired`/`not_fired`/`unknown`），否则拒绝。账目还会把 Run 记录的
+执行摘要与候选摘要对照：不一致拒绝（退出 2，不写任何行），Run 未记录摘要时照实记录但不进入可晋升集合。
+命令只写一行账目记录，`accepted` 仍然禁用。
 
 ## 4. 容器内不能做的事：平台能力边界
 
